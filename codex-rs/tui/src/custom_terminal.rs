@@ -23,6 +23,10 @@
 // SOFTWARE.
 use std::io;
 use std::io::Write;
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use crossterm::cursor::MoveTo;
 use crossterm::cursor::SetCursorStyle;
@@ -101,6 +105,19 @@ pub struct Frame<'a> {
 
     /// The buffer that is used to draw the current frame
     pub(crate) buffer: &'a mut Buffer,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TerminalDrawTimings {
+    pub(crate) autoresize: Duration,
+    pub(crate) render: Duration,
+    pub(crate) diff: Duration,
+    pub(crate) encode: Duration,
+    pub(crate) cursor: Duration,
+    pub(crate) backend_flush: Duration,
+    pub(crate) total: Duration,
+    pub(crate) commands: usize,
 }
 
 impl Frame<'_> {
@@ -303,6 +320,22 @@ where
         draw(&mut self.backend, updates.into_iter())
     }
 
+    #[cfg(test)]
+    fn flush_profiled(&mut self) -> io::Result<(Duration, Duration, usize)> {
+        let started = Instant::now();
+        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
+        let diff = started.elapsed();
+        let commands = updates.len();
+        let last_put_command = updates.iter().rfind(|command| command.is_put());
+        if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
+            self.last_known_cursor_pos = Position { x, y };
+        }
+
+        let started = Instant::now();
+        draw(&mut self.backend, updates.into_iter())?;
+        Ok((diff, started.elapsed(), commands))
+    }
+
     /// Updates the Terminal so that internal buffers match the requested area.
     ///
     /// Requested area will be saved to remain consistent when rendering. This leads to a full clear
@@ -433,6 +466,71 @@ where
         Backend::flush(&mut self.backend)?;
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn draw_profiled<F>(&mut self, render_callback: F) -> io::Result<TerminalDrawTimings>
+    where
+        F: FnOnce(&mut Frame),
+    {
+        self.try_draw_profiled(|frame| {
+            render_callback(frame);
+            io::Result::Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_draw_profiled<F, E>(
+        &mut self,
+        render_callback: F,
+    ) -> io::Result<TerminalDrawTimings>
+    where
+        F: FnOnce(&mut Frame) -> Result<(), E>,
+        E: Into<io::Error>,
+    {
+        let total_start = Instant::now();
+        let started = Instant::now();
+        self.autoresize()?;
+        let autoresize = started.elapsed();
+
+        let mut frame = self.get_frame();
+
+        let started = Instant::now();
+        render_callback(&mut frame).map_err(Into::into)?;
+        let render = started.elapsed();
+
+        let cursor_position = frame.cursor_position;
+        let cursor_style = frame.cursor_style;
+
+        let (diff, encode, commands) = self.flush_profiled()?;
+
+        let started = Instant::now();
+        match cursor_position {
+            None => self.hide_cursor()?,
+            Some(position) => {
+                self.set_cursor_style(cursor_style)?;
+                self.show_cursor()?;
+                self.set_cursor_position(position)?;
+            }
+        }
+        let cursor = started.elapsed();
+
+        self.swap_buffers();
+
+        let started = Instant::now();
+        Backend::flush(&mut self.backend)?;
+        let backend_flush = started.elapsed();
+
+        Ok(TerminalDrawTimings {
+            autoresize,
+            render,
+            diff,
+            encode,
+            cursor,
+            backend_flush,
+            total: total_start.elapsed(),
+            commands,
+        })
     }
 
     /// Hides the cursor.

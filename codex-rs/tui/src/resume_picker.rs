@@ -5126,6 +5126,7 @@ session_picker_view = "dense"
         }
         terminal.flush().expect("flush");
         assert!(terminal.backend().to_string().contains("↓ more"));
+        terminal.swap_buffers();
 
         state.density = SessionListDensity::Dense;
         state.update_viewport(height as usize, width);

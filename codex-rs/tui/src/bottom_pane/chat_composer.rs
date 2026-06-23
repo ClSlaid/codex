@@ -11361,6 +11361,7 @@ mod tests {
     #[ignore]
     fn history_recall_latency_100x8k_ab() {
         use crate::custom_terminal::Terminal;
+        use crate::custom_terminal::TerminalDrawTimings;
         use ratatui::backend::Backend;
         use ratatui::backend::ClearType;
         use ratatui::backend::WindowSize;
@@ -11371,7 +11372,16 @@ mod tests {
         use std::time::Duration;
         use std::time::Instant;
 
-        const RECALL_SAMPLES: usize = 9 * 24;
+        const RECALL_SAMPLES: usize = 9 * 240;
+
+        #[derive(Clone, Copy)]
+        struct RecallSample {
+            desired_height: Duration,
+            handle_key: Duration,
+            draw: TerminalDrawTimings,
+            total: Duration,
+            bytes_written: usize,
+        }
 
         struct BenchmarkBackend {
             size: Size,
@@ -11531,24 +11541,37 @@ mod tests {
         fn drive_recall_minimal(
             composer: &mut ChatComposer,
             terminal: &mut Terminal<BenchmarkBackend>,
-        ) -> Vec<Duration> {
+        ) -> Vec<RecallSample> {
             let mut samples = Vec::with_capacity(RECALL_SAMPLES);
             let area = Rect::new(
                 /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
             );
             for key in recall_keys() {
+                let bytes_before = terminal.backend().bytes_written;
                 let total_start = Instant::now();
+                let started = Instant::now();
                 let _ = composer.desired_height(area.width);
+                let desired_height = started.elapsed();
+
+                let started = Instant::now();
                 let _ = composer.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
-                terminal
-                    .draw(|frame| composer.render(frame.area(), frame.buffer_mut()))
+                let handle_key = started.elapsed();
+
+                let draw = terminal
+                    .draw_profiled(|frame| composer.render(frame.area(), frame.buffer_mut()))
                     .unwrap();
-                samples.push(total_start.elapsed());
+                samples.push(RecallSample {
+                    desired_height,
+                    handle_key,
+                    draw,
+                    total: total_start.elapsed(),
+                    bytes_written: terminal.backend().bytes_written - bytes_before,
+                });
             }
             samples
         }
 
-        fn measure_minimal_overhead() -> Vec<Duration> {
+        fn measure_probe_overhead() -> Vec<Duration> {
             let mut samples = Vec::with_capacity(RECALL_SAMPLES);
             for _ in 0..RECALL_SAMPLES {
                 let total_start = Instant::now();
@@ -11557,29 +11580,162 @@ mod tests {
             samples
         }
 
-        fn print_summary(label: &str, samples: &[Duration]) {
+        fn median(samples: &[Duration]) -> Duration {
             let mut sorted = samples.to_vec();
             sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn emit_result(args: std::fmt::Arguments<'_>) {
+            use std::io::Write;
+
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_fmt(args).expect("write benchmark result");
+            stdout
+                .write_all(b"\n")
+                .expect("write benchmark result newline");
+        }
+
+        fn print_duration_summary(label: &str, samples: &[Duration], probe_overhead: Duration) {
+            let mut corrected = samples
+                .iter()
+                .map(|sample| sample.saturating_sub(probe_overhead))
+                .collect::<Vec<_>>();
+            corrected.sort_unstable();
             let total = samples.iter().sum::<Duration>();
-            let p50 = sorted[sorted.len() / 2];
-            let p95 = sorted[sorted.len() * 95 / 100];
-            let max = sorted[sorted.len() - 1];
-            println!(
+            let p50 = corrected[corrected.len() / 2];
+            let p95 = corrected[corrected.len() * 95 / 100];
+            let max = corrected[corrected.len() - 1];
+            emit_result(format_args!(
                 "RESULT {label} samples={} total_ms={:.3} p50_ms={:.4} p95_ms={:.4} max_ms={:.4}",
                 samples.len(),
                 total.as_secs_f64() * 1000.0,
                 p50.as_secs_f64() * 1000.0,
                 p95.as_secs_f64() * 1000.0,
                 max.as_secs_f64() * 1000.0
+            ));
+        }
+
+        fn print_usize_summary(label: &str, samples: &[usize]) {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            let total = samples.iter().sum::<usize>();
+            let p50 = sorted[sorted.len() / 2];
+            let p95 = sorted[sorted.len() * 95 / 100];
+            let max = sorted[sorted.len() - 1];
+            emit_result(format_args!(
+                "RESULT {label} samples={} total={total} p50={p50} p95={p95} max={max}",
+                samples.len(),
+            ));
+        }
+
+        fn print_recall_summary(label: &str, samples: &[RecallSample], probe_overhead: Duration) {
+            print_duration_summary(
+                &format!("{label}.total"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.total)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.desired_height"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.desired_height)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.handle_key"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.handle_key)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_total"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.total)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_autoresize"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.autoresize)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_render"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.render)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_diff"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.diff)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_encode"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.encode)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_cursor"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.cursor)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_backend_flush"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.backend_flush)
+                    .collect::<Vec<_>>(),
+                probe_overhead,
+            );
+            print_usize_summary(
+                &format!("{label}.terminal_commands"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.commands)
+                    .collect::<Vec<_>>(),
+            );
+            print_usize_summary(
+                &format!("{label}.terminal_bytes"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.bytes_written)
+                    .collect::<Vec<_>>(),
             );
         }
 
         let entries = (0..100).map(history_text).collect::<Vec<_>>();
         let (mut composer, total_bytes, prewarm_ready) =
             build_composer(&entries, /*drain_prewarm*/ true);
-        println!("RESULT sample_bytes={total_bytes}");
-        println!("RESULT pr_prewarm_ready count={prewarm_ready}");
-        print_summary("minimal_overhead", &measure_minimal_overhead());
+        emit_result(format_args!("RESULT sample_bytes={total_bytes}"));
+        emit_result(format_args!(
+            "RESULT pr_prewarm_ready count={prewarm_ready}"
+        ));
+        let probe_overhead_samples = measure_probe_overhead();
+        let probe_overhead = median(&probe_overhead_samples);
+        print_duration_summary("probe_overhead", &probe_overhead_samples, Duration::ZERO);
         let mut terminal =
             Terminal::with_options(BenchmarkBackend::new(/*width*/ 80, /*height*/ 48))
                 .expect("terminal");
@@ -11588,7 +11744,15 @@ mod tests {
         ));
         let initial = drive_recall_minimal(&mut composer, &mut terminal);
         let repeat = drive_recall_minimal(&mut composer, &mut terminal);
-        print_summary("pr_prewarmed_custom_minimal_initial", &initial);
-        print_summary("pr_prewarmed_custom_minimal_repeat", &repeat);
+        print_recall_summary(
+            "pr_prewarmed_custom_minimal_initial",
+            &initial,
+            probe_overhead,
+        );
+        print_recall_summary(
+            "pr_prewarmed_custom_minimal_repeat",
+            &repeat,
+            probe_overhead,
+        );
     }
 }
