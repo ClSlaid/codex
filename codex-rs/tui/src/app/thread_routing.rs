@@ -5,6 +5,7 @@
 //! when the visible thread changes.
 
 use super::*;
+use crate::app_event::HistoryLookupPrewarm;
 use crate::session_resume::read_session_model;
 
 impl App {
@@ -480,6 +481,7 @@ impl App {
         thread_id: ThreadId,
         offset: usize,
         log_id: u64,
+        prewarm: Option<HistoryLookupPrewarm>,
     ) -> Result<()> {
         let history_config = codex_message_history::HistoryConfig::new(
             self.chat_widget.config_ref().codex_home.clone(),
@@ -487,13 +489,24 @@ impl App {
         );
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let entry_opt = tokio::task::spawn_blocking(move || {
-                codex_message_history::lookup(log_id, offset, &history_config)
+            let (entry_opt, prewarmed_wrap_cache) = tokio::task::spawn_blocking(move || {
+                let entry_opt = codex_message_history::lookup(log_id, offset, &history_config);
+                let prewarmed_wrap_cache = entry_opt.as_ref().and_then(|entry| {
+                    prewarm.map(|prewarm| {
+                        let decoded =
+                            crate::mention_codec::decode_history_mentions_with_at_mentions(
+                                &entry.text,
+                                prewarm.at_mentions_enabled,
+                            );
+                        crate::bottom_pane::prepare_textarea_wrap_cache(prewarm.width, decoded.text)
+                    })
+                });
+                (entry_opt, prewarmed_wrap_cache)
             })
             .await
             .unwrap_or_else(|err| {
                 tracing::warn!(error = %err, "history lookup task failed");
-                None
+                (None, None)
             });
 
             app_event_tx.send(AppEvent::ThreadHistoryEntryResponse {
@@ -502,6 +515,7 @@ impl App {
                     offset,
                     log_id,
                     entry: entry_opt.map(|entry| entry.text),
+                    prewarmed_wrap_cache,
                 },
             });
         });

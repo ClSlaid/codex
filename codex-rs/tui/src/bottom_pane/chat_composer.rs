@@ -234,6 +234,7 @@ use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::textarea::PreparedWrapCache;
 use crate::bottom_pane::textarea::TextArea;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
@@ -249,6 +250,8 @@ use codex_file_search::FileMatch;
 #[cfg(test)]
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -262,6 +265,8 @@ use ratatui::style::Color;
 /// If the pasted content exceeds this number of characters, replace it with a
 /// placeholder in the UI.
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+const HISTORY_RECALL_PREWARM_LIMIT: usize = 32;
+const HISTORY_RECALL_PREWARM_RESIZE_DELAY: Duration = Duration::from_secs(1);
 
 fn user_input_too_large_message(actual_chars: usize) -> String {
     format!(
@@ -356,6 +361,8 @@ pub(crate) struct ChatComposer {
     history: ChatComposerHistory,
     footer: FooterState,
     has_focus: bool,
+    last_textarea_width: Cell<Option<u16>>,
+    history_prewarm_due_at: Cell<Option<Instant>>,
     frame_requester: Option<FrameRequester>,
     attachments: AttachmentState,
     placeholder_text: String,
@@ -524,6 +531,8 @@ impl ChatComposer {
                 reasoning_up_key: primary_binding(&default_keymap.chat.increase_reasoning_effort),
             },
             has_focus: has_input_focus,
+            last_textarea_width: Cell::new(None),
+            history_prewarm_due_at: Cell::new(None),
             frame_requester: None,
             attachments: AttachmentState::default(),
             placeholder_text,
@@ -585,6 +594,9 @@ impl ChatComposer {
     }
 
     pub fn set_mentions_v2_enabled(&mut self, enabled: bool) {
+        if self.mentions_v2_enabled != enabled {
+            self.reset_history_prewarm_schedule();
+        }
         self.mentions_v2_enabled = enabled;
         self.history.set_at_mention_restore_enabled(enabled);
         self.sync_popups();
@@ -815,6 +827,14 @@ impl ChatComposer {
         entry_count: usize,
     ) {
         self.history.set_metadata(thread_id, log_id, entry_count);
+        self.reset_history_prewarm_schedule();
+    }
+
+    fn reset_history_prewarm_schedule(&self) {
+        self.history_prewarm_due_at.set(None);
+        if self.last_textarea_width.get().is_some() {
+            self.start_history_prewarm_after(Duration::ZERO);
+        }
     }
 
     /// Integrate an asynchronous response to an on-demand history lookup.
@@ -828,27 +848,107 @@ impl ChatComposer {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
+        prewarmed_wrap_cache: Option<PreparedWrapCache>,
     ) -> bool {
-        match self
-            .history
-            .on_entry_response(log_id, offset, entry, &self.app_event_tx)
-        {
+        let prewarm_width = prewarmed_wrap_cache.as_ref().map(PreparedWrapCache::width);
+        match self.history.on_entry_response(
+            log_id,
+            offset,
+            entry,
+            prewarm_width,
+            &self.app_event_tx,
+        ) {
             HistoryEntryResponse::Found(entry) => {
+                self.remember_current_width_wrap_cache(prewarmed_wrap_cache);
                 // Persistent ↑/↓ history is text-only (backwards-compatible and avoids persisting
                 // attachments), but local in-session ↑/↓ history can rehydrate elements and image paths.
                 self.apply_history_entry(entry);
                 true
             }
             HistoryEntryResponse::Search(result) => {
+                self.remember_current_width_wrap_cache(prewarmed_wrap_cache);
                 self.apply_history_search_result(result);
                 true
+            }
+            HistoryEntryResponse::Prewarmed => {
+                self.remember_current_width_wrap_cache(prewarmed_wrap_cache);
+                false
             }
             HistoryEntryResponse::Ignored => false,
         }
     }
 
+    fn remember_current_width_wrap_cache(&self, cache: Option<PreparedWrapCache>) {
+        let Some(cache) = cache else {
+            return;
+        };
+        if self.last_textarea_width.get() == Some(cache.width()) {
+            self.draft.textarea.remember_prepared_wrap_cache(cache);
+        }
+    }
+
     pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
+        self.warm_history_entry_for_recall(&entry);
         self.history.record_replayed_submission(entry);
+    }
+
+    fn record_local_history_entry(&mut self, entry: HistoryEntry) {
+        self.warm_history_entry_for_recall(&entry);
+        self.history.record_local_submission(entry);
+    }
+
+    fn warm_history_entry_for_recall(&self, entry: &HistoryEntry) {
+        let Some(width) = self.last_textarea_width.get() else {
+            return;
+        };
+        self.draft
+            .textarea
+            .warm_recent_wrap_cache(width, &entry.text);
+    }
+
+    pub(crate) fn schedule_history_cache_prewarm_at(&mut self, now: Instant) {
+        let Some(width) = self.last_textarea_width.get() else {
+            return;
+        };
+        let Some(due_at) = self.history_prewarm_due_at.get() else {
+            return;
+        };
+        if now < due_at {
+            if let Some(frame_requester) = &self.frame_requester {
+                frame_requester.schedule_frame_in(due_at - now);
+            }
+            return;
+        }
+
+        self.history.set_prewarm_width(width);
+        self.history
+            .schedule_recent_prewarm(HISTORY_RECALL_PREWARM_LIMIT, &self.app_event_tx);
+        self.history_prewarm_due_at.set(None);
+    }
+
+    fn observe_textarea_width(&self, width: u16) {
+        if self.last_textarea_width.get() == Some(width) {
+            return;
+        }
+        let delay = if self.last_textarea_width.get().is_some() {
+            HISTORY_RECALL_PREWARM_RESIZE_DELAY
+        } else {
+            Duration::ZERO
+        };
+        self.last_textarea_width.set(Some(width));
+        self.start_history_prewarm_after(delay);
+    }
+
+    fn start_history_prewarm_after(&self, delay: Duration) {
+        self.history_prewarm_due_at
+            .set(Some(Instant::now() + delay));
+        if let Some(frame_requester) = &self.frame_requester {
+            if delay > Duration::ZERO {
+                frame_requester.schedule_frame_in(delay);
+            } else {
+                frame_requester.schedule_frame();
+            }
+        }
     }
 
     /// Integrate pasted text into the composer.
@@ -1259,10 +1359,14 @@ impl ChatComposer {
             && !self.draft.textarea.text().is_empty()
             && self.draft.textarea.cursor() == self.draft.textarea.vim_normal_end_cursor()
         {
-            self.current_text().len()
+            self.current_text_len()
         } else {
             self.current_cursor()
         }
+    }
+
+    fn current_text_len(&self) -> usize {
+        self.draft.textarea.text().len() + usize::from(self.draft.is_bash_mode)
     }
 
     fn set_current_cursor(&mut self, cursor: usize) {
@@ -1390,7 +1494,7 @@ impl ChatComposer {
         self.set_text_content(String::new(), Vec::new(), Vec::new());
         self.attachments.clear_remote_image_urls();
         self.history.reset_navigation();
-        self.history.record_local_submission(HistoryEntry {
+        self.record_local_history_entry(HistoryEntry {
             text: previous.clone(),
             text_elements,
             local_image_paths,
@@ -1407,6 +1511,14 @@ impl ChatComposer {
             format!("!{}", self.draft.textarea.text())
         } else {
             self.draft.textarea.text().to_string()
+        }
+    }
+
+    fn current_text_for_history_navigation(&self) -> Cow<'_, str> {
+        if self.draft.is_bash_mode {
+            Cow::Owned(self.current_text())
+        } else {
+            Cow::Borrowed(self.draft.textarea.text())
         }
     }
 
@@ -1480,7 +1592,7 @@ impl ChatComposer {
     /// slot is consumed on the first call.
     pub(crate) fn record_pending_slash_command_history(&mut self) {
         if let Some(entry) = self.pending_slash_command_history.take() {
-            self.history.record_local_submission(entry);
+            self.record_local_history_entry(entry);
         }
     }
 
@@ -2716,7 +2828,7 @@ impl ChatComposer {
         }
         self.draft.recent_submission_mention_bindings = original_mention_bindings.clone();
         if record_history && (!text.is_empty() || !self.attachments.is_empty()) {
-            self.history.record_local_submission(HistoryEntry {
+            self.record_local_history_entry(HistoryEntry {
                 text: text.clone(),
                 text_elements: text_elements.clone(),
                 local_image_paths: self.attachments.local_image_paths(),
@@ -3141,10 +3253,12 @@ impl ChatComposer {
             )
         };
         if history_up_pressed || history_down_pressed {
-            if self
-                .history
-                .should_handle_navigation(&self.current_text(), self.history_navigation_cursor())
-            {
+            let should_navigate_history = {
+                let text = self.current_text_for_history_navigation();
+                self.history
+                    .should_handle_navigation(text.as_ref(), self.history_navigation_cursor())
+            };
+            if should_navigate_history {
                 let replace_entry = if history_up_pressed {
                     self.history.navigate_up(&self.app_event_tx)
                 } else {
@@ -3519,9 +3633,10 @@ impl ChatComposer {
         } else {
             self.current_editable_at_token()
         };
-        let browsing_history = self
-            .history
-            .should_handle_navigation(&self.current_text(), self.history_navigation_cursor());
+        let browsing_history = self.history.should_handle_navigation(
+            self.current_text_for_history_navigation().as_ref(),
+            self.history_navigation_cursor(),
+        );
         // When browsing input history (shell-style Up/Down recall), skip all popup
         // synchronization so nothing steals focus from continued history navigation.
         if browsing_history {
@@ -4142,6 +4257,9 @@ impl ChatComposer {
     ) {
         let [composer_rect, remote_images_rect, textarea_rect, popup_rect] =
             self.layout_areas_with_textarea_right_reserve(area, textarea_right_reserve);
+        if textarea_rect.width > 0 {
+            self.observe_textarea_width(textarea_rect.width);
+        }
         match &self.popups.active {
             ActivePopup::Command(popup) => {
                 popup.render_ref(popup_rect, buf);
@@ -4536,6 +4654,61 @@ mod tests {
             "",
             "expected blank spacing row above hints but saw: {spacing_row:?}",
         );
+    }
+
+    #[test]
+    fn history_prewarm_debounces_width_changes() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            AppEventSender::new(tx),
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_history_metadata(ThreadId::new(), /*log_id*/ 7, /*entry_count*/ 2);
+
+        composer.observe_textarea_width(80);
+        composer.schedule_history_cache_prewarm_at(
+            composer
+                .history_prewarm_due_at
+                .get()
+                .expect("prewarm should be due"),
+        );
+        for _ in 0..2 {
+            assert!(rx.try_recv().is_ok());
+        }
+        assert!(rx.try_recv().is_err());
+
+        composer.observe_textarea_width(100);
+        let first_due_at = composer
+            .history_prewarm_due_at
+            .get()
+            .expect("resize prewarm should be delayed");
+        composer
+            .schedule_history_cache_prewarm_at(first_due_at - Duration::from_millis(/*millis*/ 1));
+        assert!(rx.try_recv().is_err());
+
+        composer.observe_textarea_width(120);
+        let second_due_at = composer
+            .history_prewarm_due_at
+            .get()
+            .expect("second resize prewarm should be delayed");
+        assert!(rx.try_recv().is_err());
+
+        composer.schedule_history_cache_prewarm_at(first_due_at);
+        assert!(rx.try_recv().is_err());
+
+        composer.schedule_history_cache_prewarm_at(second_due_at);
+        for _ in 0..2 {
+            let AppEvent::LookupMessageHistoryEntry { prewarm, .. } =
+                rx.try_recv().expect("expected debounced prewarm")
+            else {
+                panic!("unexpected event variant");
+            };
+            assert_eq!(prewarm.expect("prewarm request").width, 120);
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

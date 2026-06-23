@@ -149,6 +149,11 @@ mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
 pub(crate) use hooks_browser_view::HooksBrowserView;
 pub(crate) use selection_tabs::SelectionTab;
+pub(crate) use textarea::PreparedWrapCache;
+
+pub(crate) fn prepare_textarea_wrap_cache(width: u16, text: String) -> PreparedWrapCache {
+    textarea::TextArea::prepare_wrap_cache(width, text)
+}
 
 /// How long the "press again to quit" hint stays visible.
 ///
@@ -722,6 +727,7 @@ impl BottomPane {
 
     fn pre_draw_tick_at(&mut self, now: Instant) {
         self.composer.sync_popups();
+        self.composer.schedule_history_cache_prewarm_at(now);
         self.maybe_show_delayed_approval_requests_at(now);
         self.tick_active_view(now);
         self.schedule_active_view_frame();
@@ -1615,10 +1621,11 @@ impl BottomPane {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
+        prewarmed_wrap_cache: Option<textarea::PreparedWrapCache>,
     ) {
-        let updated = self
-            .composer
-            .on_history_entry_response(log_id, offset, entry);
+        let updated =
+            self.composer
+                .on_history_entry_response(log_id, offset, entry, prewarmed_wrap_cache);
 
         if updated {
             self.composer.sync_popups();

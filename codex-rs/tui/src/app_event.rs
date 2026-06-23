@@ -39,6 +39,7 @@ use codex_utils_approval_presets::ApprovalPreset;
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerStartedThread;
 use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::PreparedWrapCache;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::chatwidget::UserMessage;
@@ -69,6 +70,13 @@ pub(crate) struct HistoryLookupResponse {
     pub(crate) offset: usize,
     pub(crate) log_id: u64,
     pub(crate) entry: Option<String>,
+    pub(crate) prewarmed_wrap_cache: Option<PreparedWrapCache>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryLookupPrewarm {
+    pub(crate) width: u16,
+    pub(crate) at_mentions_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +189,7 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
         offset: usize,
         log_id: u64,
+        prewarm: Option<HistoryLookupPrewarm>,
     },
 
     /// Start a new session.

@@ -149,6 +149,7 @@ async fn replayed_user_messages_seed_composer_history() {
         offset,
         log_id: 1,
         entry: Some(entry.to_string()),
+        prewarmed_wrap_cache: None,
     };
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));

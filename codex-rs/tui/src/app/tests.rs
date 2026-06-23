@@ -433,8 +433,10 @@ async fn history_lookup_response_is_routed_to_requesting_thread() -> Result<()> 
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
 
-    app.lookup_message_history_entry(thread_id, /*offset*/ 0, /*log_id*/ 1)
-        .await?;
+    app.lookup_message_history_entry(
+        thread_id, /*offset*/ 0, /*log_id*/ 1, /*prewarm*/ None,
+    )
+    .await?;
 
     let app_event = tokio::time::timeout(Duration::from_secs(1), app_event_rx.recv())
         .await

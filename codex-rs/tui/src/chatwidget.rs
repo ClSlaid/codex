@@ -1176,9 +1176,10 @@ impl ChatWidget {
             offset,
             log_id,
             entry,
+            prewarmed_wrap_cache,
         } = event;
         self.bottom_pane
-            .on_history_entry_response(log_id, offset, entry);
+            .on_history_entry_response(log_id, offset, entry, prewarmed_wrap_cache);
     }
 
     pub(crate) fn pre_draw_tick(&mut self) {

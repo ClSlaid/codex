@@ -355,8 +355,9 @@ impl App {
                 thread_id,
                 offset,
                 log_id,
+                prewarm,
             } => {
-                self.lookup_message_history_entry(thread_id, offset, log_id)
+                self.lookup_message_history_entry(thread_id, offset, log_id, prewarm)
                     .await?;
             }
             AppEvent::ApproveRecentAutoReviewDenial { thread_id, id } => {

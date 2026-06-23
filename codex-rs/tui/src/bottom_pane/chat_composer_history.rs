@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::app_event::AppEvent;
+use crate::app_event::HistoryLookupPrewarm;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::MentionBinding;
 use crate::mention_codec::decode_history_mentions_with_at_mentions;
@@ -126,6 +127,9 @@ pub(crate) struct ChatComposerHistory {
 
     /// Cache of persistent history entries fetched on-demand (text-only).
     fetched_history: HashMap<usize, HistoryEntry>,
+    prewarm_width: Option<u16>,
+    pending_prewarm_offsets: HashSet<usize>,
+    completed_prewarm_offsets: HashSet<usize>,
 
     /// Current cursor within the combined (persistent + local) history. `None`
     /// indicates the user is *not* currently browsing history.
@@ -174,6 +178,7 @@ pub(crate) enum HistorySearchResult {
 pub(crate) enum HistoryEntryResponse {
     Found(HistoryEntry),
     Search(HistorySearchResult),
+    Prewarmed,
     Ignored,
 }
 
@@ -234,6 +239,9 @@ impl ChatComposerHistory {
             local_history: Vec::new(),
             replay_seeded_history: Vec::new(),
             fetched_history: HashMap::new(),
+            prewarm_width: None,
+            pending_prewarm_offsets: HashSet::new(),
+            completed_prewarm_offsets: HashSet::new(),
             history_cursor: None,
             pending_navigation_direction: None,
             last_history_text: None,
@@ -248,6 +256,7 @@ impl ChatComposerHistory {
         }
         self.at_mention_restore_enabled = enabled;
         self.fetched_history.clear();
+        self.clear_prewarm_cache();
         self.history_cursor = None;
         self.last_history_text = None;
         self.search = None;
@@ -263,6 +272,7 @@ impl ChatComposerHistory {
         self.persistent_log_id = Some(log_id);
         self.persistent_entry_count = entry_count;
         self.fetched_history.clear();
+        self.clear_prewarm_cache();
         self.local_history.clear();
         self.replay_seeded_history.clear();
         self.history_cursor = None;
@@ -277,6 +287,48 @@ impl ChatComposerHistory {
     /// search state is reset because a new newest entry changes the combined history offset space.
     pub fn record_local_submission(&mut self, entry: HistoryEntry) {
         self.record_local_submission_inner(entry);
+    }
+
+    fn clear_prewarm_cache(&mut self) {
+        self.prewarm_width = None;
+        self.pending_prewarm_offsets.clear();
+        self.completed_prewarm_offsets.clear();
+    }
+
+    pub fn set_prewarm_width(&mut self, width: u16) {
+        if self.prewarm_width == Some(width) {
+            return;
+        }
+        self.prewarm_width = Some(width);
+        self.pending_prewarm_offsets.clear();
+        self.completed_prewarm_offsets.clear();
+    }
+
+    pub fn schedule_recent_prewarm(&mut self, limit: usize, app_event_tx: &AppEventSender) {
+        let (Some(thread_id), Some(log_id)) = (self.thread_id, self.persistent_log_id) else {
+            return;
+        };
+        let Some(width) = self.prewarm_width else {
+            return;
+        };
+        let start = self.persistent_entry_count.saturating_sub(limit);
+        for offset in (start..self.persistent_entry_count).rev() {
+            if self.pending_prewarm_offsets.contains(&offset)
+                || self.completed_prewarm_offsets.contains(&offset)
+            {
+                continue;
+            }
+            self.pending_prewarm_offsets.insert(offset);
+            app_event_tx.send(AppEvent::LookupMessageHistoryEntry {
+                thread_id,
+                offset,
+                log_id,
+                prewarm: Some(HistoryLookupPrewarm {
+                    width,
+                    at_mentions_enabled: self.at_mention_restore_enabled,
+                }),
+            });
+        }
     }
 
     pub fn record_replayed_submission(&mut self, entry: HistoryEntry) {
@@ -435,10 +487,18 @@ impl ChatComposerHistory {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
+        prewarm_width: Option<u16>,
         app_event_tx: &AppEventSender,
     ) -> HistoryEntryResponse {
         if self.persistent_log_id != Some(log_id) {
             return HistoryEntryResponse::Ignored;
+        }
+        let was_pending_prewarm = prewarm_width
+            .filter(|width| Some(*width) == self.prewarm_width)
+            .map(|_| self.pending_prewarm_offsets.remove(&offset))
+            .unwrap_or(false);
+        if was_pending_prewarm {
+            self.completed_prewarm_offsets.insert(offset);
         }
 
         let entry = entry.map(|entry| {
@@ -496,6 +556,10 @@ impl ChatComposerHistory {
             }
             self.last_history_text = Some(entry.text.clone());
             return HistoryEntryResponse::Found(entry);
+        }
+
+        if was_pending_prewarm && entry.is_some() {
+            return HistoryEntryResponse::Prewarmed;
         }
 
         HistoryEntryResponse::Ignored
@@ -669,6 +733,7 @@ impl ChatComposerHistory {
                     thread_id,
                     offset,
                     log_id,
+                    prewarm: None,
                 });
                 return HistorySearchResult::Pending;
             }
@@ -803,6 +868,7 @@ impl ChatComposerHistory {
                     thread_id,
                     offset: global_idx,
                     log_id,
+                    prewarm: None,
                 });
             }
             return None;
@@ -936,6 +1002,90 @@ mod tests {
     }
 
     #[test]
+    fn schedule_recent_prewarm_requests_newest_uncached_persistent_entries() {
+        let (tx, mut rx) = unbounded_channel();
+        let tx = AppEventSender::new(tx);
+        let mut history = ChatComposerHistory::new();
+        let thread_id = test_thread_id();
+        history.set_metadata(thread_id, /*log_id*/ 7, /*entry_count*/ 40);
+        history.set_at_mention_restore_enabled(/*enabled*/ true);
+        history.set_prewarm_width(/*width*/ 120);
+
+        history.schedule_recent_prewarm(/*limit*/ 32, &tx);
+
+        for expected_offset in (8..40).rev() {
+            let AppEvent::LookupMessageHistoryEntry {
+                thread_id: response_thread_id,
+                offset,
+                log_id,
+                prewarm,
+            } = rx.try_recv().expect("expected prewarm lookup")
+            else {
+                panic!("unexpected event variant");
+            };
+            assert_eq!(response_thread_id, thread_id);
+            assert_eq!(offset, expected_offset);
+            assert_eq!(log_id, 7);
+            assert_eq!(
+                prewarm,
+                Some(HistoryLookupPrewarm {
+                    width: 120,
+                    at_mentions_enabled: true,
+                })
+            );
+        }
+        assert!(rx.try_recv().is_err());
+
+        history.schedule_recent_prewarm(/*limit*/ 32, &tx);
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(
+            HistoryEntryResponse::Prewarmed,
+            history.on_entry_response(
+                /*log_id*/ 7,
+                /*offset*/ 39,
+                Some("newest".into()),
+                /*prewarm_width*/ Some(120),
+                &tx,
+            )
+        );
+        assert_eq!(
+            history.fetched_history.get(&39),
+            Some(&HistoryEntry::new("newest".to_string()))
+        );
+
+        assert_eq!(
+            HistoryEntryResponse::Ignored,
+            history.on_entry_response(
+                /*log_id*/ 7,
+                /*offset*/ 38,
+                None,
+                /*prewarm_width*/ Some(120),
+                &tx,
+            )
+        );
+        history.schedule_recent_prewarm(/*limit*/ 32, &tx);
+        assert!(rx.try_recv().is_err());
+
+        history.set_prewarm_width(/*width*/ 121);
+        history.schedule_recent_prewarm(/*limit*/ 1, &tx);
+        let AppEvent::LookupMessageHistoryEntry {
+            offset, prewarm, ..
+        } = rx.try_recv().expect("expected prewarm after width change")
+        else {
+            panic!("unexpected event variant");
+        };
+        assert_eq!(offset, 39);
+        assert_eq!(
+            prewarm,
+            Some(HistoryLookupPrewarm {
+                width: 121,
+                at_mentions_enabled: true,
+            })
+        );
+    }
+
+    #[test]
     fn persistent_restore_gates_at_mentions() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
@@ -947,6 +1097,7 @@ mod tests {
             /*log_id*/ 42,
             /*offset*/ 0,
             Some("[@sample](plugin://sample@test) and [$figma](app://figma)".to_string()),
+            /*prewarm_width*/ None,
             &tx,
         );
         assert_eq!(
@@ -978,6 +1129,7 @@ mod tests {
             /*log_id*/ 42,
             /*offset*/ 0,
             Some("[@sample](plugin://sample@test) and [$figma](app://figma)".to_string()),
+            /*prewarm_width*/ None,
             &tx,
         );
         assert_eq!(
@@ -1031,6 +1183,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = event
         else {
             panic!("unexpected event variant");
@@ -1038,6 +1191,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 2);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         // Inject the async response.
         assert_eq!(
@@ -1046,6 +1200,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 2,
                 Some("latest".into()),
+                /*prewarm_width*/ None,
                 &tx
             )
         );
@@ -1059,6 +1214,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = event2
         else {
             panic!("unexpected event variant");
@@ -1066,6 +1222,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 1);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         assert_eq!(
             HistoryEntryResponse::Found(HistoryEntry::new("older".to_string())),
@@ -1073,6 +1230,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 1,
                 Some("older".into()),
+                /*prewarm_width*/ None,
                 &tx
             )
         );
@@ -1228,6 +1386,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 2,
                 Some("needle latest".into()),
+                /*prewarm_width*/ None,
                 &tx,
             )
         );
@@ -1248,6 +1407,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 1,
                 Some("not a match".into()),
+                /*prewarm_width*/ None,
                 &tx,
             )
         );
@@ -1258,6 +1418,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 0,
                 Some("also not a match".into()),
+                /*prewarm_width*/ None,
                 &tx,
             )
         );
@@ -1297,6 +1458,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = rx.try_recv().expect("expected latest lookup")
         else {
             panic!("unexpected event variant");
@@ -1304,6 +1466,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 2);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         assert_eq!(
             HistoryEntryResponse::Search(HistorySearchResult::Pending),
@@ -1311,6 +1474,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 2,
                 Some("latest".into()),
+                /*prewarm_width*/ None,
                 &tx
             )
         );
@@ -1318,6 +1482,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = rx.try_recv().expect("expected next lookup")
         else {
             panic!("unexpected event variant");
@@ -1325,6 +1490,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 1);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         assert_eq!(
             HistoryEntryResponse::Search(HistorySearchResult::Found(HistoryEntry::new(
@@ -1334,6 +1500,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 1,
                 Some("older command".into()),
+                /*prewarm_width*/ None,
                 &tx
             )
         );
@@ -1365,6 +1532,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 3,
                 Some("needle same".into()),
+                /*prewarm_width*/ None,
                 &tx,
             )
         );
@@ -1385,6 +1553,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 2,
                 Some("needle same".into()),
+                /*prewarm_width*/ None,
                 &tx,
             )
         );
@@ -1395,6 +1564,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 1,
                 Some("not a match".into()),
+                /*prewarm_width*/ None,
                 &tx,
             )
         );
@@ -1407,6 +1577,7 @@ mod tests {
                 /*log_id*/ 1,
                 /*offset*/ 0,
                 Some("needle older".into()),
+                /*prewarm_width*/ None,
                 &tx,
             )
         );

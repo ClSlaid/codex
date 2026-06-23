@@ -24,6 +24,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
+use ratatui::buffer::Cell;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Style;
@@ -31,6 +32,7 @@ use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
 use std::cell::Ref;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use textwrap::Options;
 use unicode_segmentation::UnicodeSegmentation;
@@ -44,6 +46,8 @@ use self::vim::VimPending;
 use self::vim::VimTextObjectScope;
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+const RECENT_WRAP_CACHE_LIMIT: usize = 32;
+const RECENT_WRAP_CACHE_MAX_TEXT_BYTES: usize = 64 * 1024;
 
 fn is_word_separator(ch: char) -> bool {
     WORD_SEPARATORS.contains(ch)
@@ -75,6 +79,43 @@ fn split_word_pieces(run: &str) -> Vec<(usize, &str)> {
     pieces
 }
 
+fn wrap_textarea_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
+    crate::wrapping::wrap_ranges(
+        text,
+        Options::new(width as usize).wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
+    )
+}
+
+fn rendered_lines_for_ranges(text: &str, lines: &[Range<usize>]) -> Vec<RenderedLine> {
+    lines
+        .iter()
+        .map(|range| {
+            let line_range = range.start..range.end - 1;
+            let mut col = 0;
+            let mut cells = Vec::new();
+            for (offset, symbol) in text[line_range.clone()].grapheme_indices(true) {
+                if symbol.contains(|ch: char| ch.is_control()) {
+                    continue;
+                }
+                let width = symbol.width() as u16;
+                if width == 0 {
+                    continue;
+                }
+                let mut default_cell = Cell::default();
+                default_cell.set_symbol(symbol);
+                cells.push(RenderedCell {
+                    col,
+                    range: line_range.start + offset..line_range.start + offset + symbol.len(),
+                    width,
+                    default_cell,
+                });
+                col = col.saturating_add(width);
+            }
+            cells
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct TextElement {
     id: u64,
@@ -99,8 +140,10 @@ pub(crate) struct TextElementSnapshot {
 #[derive(Debug)]
 pub(crate) struct TextArea {
     text: String,
+    generation: u64,
     cursor_pos: usize,
     wrap_cache: RefCell<Option<WrapCache>>,
+    recent_wrap_caches: RefCell<VecDeque<WrapCache>>,
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
     next_element_id: u64,
@@ -118,7 +161,29 @@ pub(crate) struct TextArea {
 #[derive(Debug, Clone)]
 struct WrapCache {
     width: u16,
+    generation: u64,
+    text: String,
     lines: Vec<Range<usize>>,
+    rendered_lines: Vec<RenderedLine>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedWrapCache(WrapCache);
+
+impl PreparedWrapCache {
+    pub(crate) fn width(&self) -> u16 {
+        self.0.width
+    }
+}
+
+type RenderedLine = Vec<RenderedCell>;
+
+#[derive(Debug, Clone)]
+struct RenderedCell {
+    col: u16,
+    range: Range<usize>,
+    width: u16,
+    default_cell: Cell,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -136,12 +201,92 @@ enum KillBufferKind {
 }
 
 impl TextArea {
+    fn stash_wrap_cache(&self) {
+        let Some(cache) = self.wrap_cache.borrow_mut().take() else {
+            return;
+        };
+        self.remember_wrap_cache(cache);
+    }
+
+    fn remember_wrap_cache(&self, cache: WrapCache) {
+        if cache.text.is_empty() || cache.text.len() > RECENT_WRAP_CACHE_MAX_TEXT_BYTES {
+            return;
+        }
+
+        let mut recent = self.recent_wrap_caches.borrow_mut();
+        if recent
+            .iter()
+            .any(|cached| cached.width == cache.width && cached.text == cache.text)
+        {
+            return;
+        }
+        recent.push_front(cache);
+        recent.truncate(RECENT_WRAP_CACHE_LIMIT);
+    }
+
+    fn take_recent_wrap_cache(&self, width: u16, text: &str) -> Option<WrapCache> {
+        let mut recent = self.recent_wrap_caches.borrow_mut();
+        let index = recent
+            .iter()
+            .position(|cached| cached.width == width && cached.text == text)?;
+        recent.remove(index)
+    }
+
+    pub(crate) fn warm_recent_wrap_cache(&self, width: u16, text: &str) {
+        if text.is_empty() || text.len() > RECENT_WRAP_CACHE_MAX_TEXT_BYTES {
+            return;
+        }
+        if self
+            .recent_wrap_caches
+            .borrow()
+            .iter()
+            .any(|cached| cached.width == width && cached.text == text)
+        {
+            return;
+        }
+        if let Some(cache) = self.wrap_cache.borrow().as_ref()
+            && cache.width == width
+            && cache.text == text
+        {
+            self.remember_wrap_cache(cache.clone());
+            return;
+        }
+
+        let lines = wrap_textarea_ranges(text, width);
+        let rendered_lines = rendered_lines_for_ranges(text, &lines);
+        self.remember_wrap_cache(WrapCache {
+            width,
+            generation: 0,
+            text: text.to_string(),
+            lines,
+            rendered_lines,
+        });
+    }
+
+    pub(crate) fn prepare_wrap_cache(width: u16, text: String) -> PreparedWrapCache {
+        let lines = wrap_textarea_ranges(&text, width);
+        let rendered_lines = rendered_lines_for_ranges(&text, &lines);
+        PreparedWrapCache(WrapCache {
+            width,
+            generation: 0,
+            text,
+            lines,
+            rendered_lines,
+        })
+    }
+
+    pub(crate) fn remember_prepared_wrap_cache(&self, cache: PreparedWrapCache) {
+        self.remember_wrap_cache(cache.0);
+    }
+
     pub fn new() -> Self {
         let defaults = RuntimeKeymap::defaults();
         Self {
             text: String::new(),
+            generation: 0,
             cursor_pos: 0,
             wrap_cache: RefCell::new(None),
+            recent_wrap_caches: RefCell::new(VecDeque::new()),
             preferred_col: None,
             elements: Vec::new(),
             next_element_id: 1,
@@ -190,8 +335,10 @@ impl TextArea {
     }
 
     fn set_text_inner(&mut self, text: &str, elements: Option<&[UserTextElement]>) {
+        self.stash_wrap_cache();
         // Stage 1: replace the raw text and keep the cursor in a safe byte range.
         self.text = text.to_string();
+        self.generation = self.generation.wrapping_add(1);
         self.cursor_pos = self.cursor_pos.clamp(0, self.text.len());
         // Stage 2: rebuild element ranges from scratch against the new text.
         self.elements.clear();
@@ -216,7 +363,6 @@ impl TextArea {
         // The kill buffer is editing history rather than visible-buffer state, so full-buffer
         // replacements intentionally leave it alone.
         self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
-        self.wrap_cache.replace(None);
         self.preferred_col = None;
     }
 
@@ -346,6 +492,7 @@ impl TextArea {
     pub fn insert_str_at(&mut self, pos: usize, text: &str) {
         let pos = self.clamp_pos_for_insertion(pos);
         self.text.insert_str(pos, text);
+        self.generation = self.generation.wrapping_add(1);
         self.wrap_cache.replace(None);
         if pos <= self.cursor_pos {
             self.cursor_pos += text.len();
@@ -371,6 +518,7 @@ impl TextArea {
         let diff = inserted_len as isize - removed_len as isize;
 
         self.text.replace_range(range, text);
+        self.generation = self.generation.wrapping_add(1);
         self.wrap_cache.replace(None);
         self.preferred_col = None;
         self.update_elements_after_replace(start, end, inserted_len);
@@ -1814,25 +1962,41 @@ impl TextArea {
     }
 
     #[expect(clippy::unwrap_used)]
-    fn wrapped_lines(&self, width: u16) -> Ref<'_, Vec<Range<usize>>> {
+    fn wrapped_cache(&self, width: u16) -> Ref<'_, WrapCache> {
         // Ensure cache is ready (potentially mutably borrow, then drop)
         {
             let mut cache = self.wrap_cache.borrow_mut();
             let needs_recalc = match cache.as_ref() {
-                Some(c) => c.width != width,
+                Some(c) => c.width != width || c.generation != self.generation,
                 None => true,
             };
             if needs_recalc {
-                let lines = crate::wrapping::wrap_ranges(
-                    &self.text,
-                    Options::new(width as usize).wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-                );
-                *cache = Some(WrapCache { width, lines });
+                if let Some(old_cache) = cache.take() {
+                    self.remember_wrap_cache(old_cache);
+                }
+                if let Some(mut reused) = self.take_recent_wrap_cache(width, &self.text) {
+                    reused.generation = self.generation;
+                    *cache = Some(reused);
+                } else {
+                    let lines = wrap_textarea_ranges(&self.text, width);
+                    let rendered_lines = rendered_lines_for_ranges(&self.text, &lines);
+                    *cache = Some(WrapCache {
+                        width,
+                        generation: self.generation,
+                        text: self.text.clone(),
+                        lines,
+                        rendered_lines,
+                    });
+                }
             }
         }
 
         let cache = self.wrap_cache.borrow();
-        Ref::map(cache, |c| &c.as_ref().unwrap().lines)
+        Ref::map(cache, |c| c.as_ref().unwrap())
+    }
+
+    fn wrapped_lines(&self, width: u16) -> Ref<'_, Vec<Range<usize>>> {
+        Ref::map(self.wrapped_cache(width), |cache| &cache.lines)
     }
 
     /// Calculate the scroll offset that should be used to satisfy the
@@ -1871,8 +2035,15 @@ impl TextArea {
 
 impl WidgetRef for &TextArea {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        let lines = self.wrapped_lines(area.width);
-        self.render_lines(area, buf, &lines, 0..lines.len(), Style::default(), &[]);
+        let cache = self.wrapped_cache(area.width);
+        self.render_lines(
+            area,
+            buf,
+            &cache,
+            0..cache.lines.len(),
+            Style::default(),
+            &[],
+        );
     }
 }
 
@@ -1880,13 +2051,13 @@ impl StatefulWidgetRef for &TextArea {
     type State = TextAreaState;
 
     fn render_ref(&self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let lines = self.wrapped_lines(area.width);
-        let scroll = self.effective_scroll(area.height, &lines, state.scroll);
+        let cache = self.wrapped_cache(area.width);
+        let scroll = self.effective_scroll(area.height, &cache.lines, state.scroll);
         state.scroll = scroll;
 
         let start = scroll as usize;
-        let end = (scroll + area.height).min(lines.len() as u16) as usize;
-        self.render_lines(area, buf, &lines, start..end, Style::default(), &[]);
+        let end = (scroll + area.height).min(cache.lines.len() as u16) as usize;
+        self.render_lines(area, buf, &cache, start..end, Style::default(), &[]);
     }
 }
 
@@ -1898,13 +2069,13 @@ impl TextArea {
         state: &mut TextAreaState,
         mask_char: char,
     ) {
-        let lines = self.wrapped_lines(area.width);
-        let scroll = self.effective_scroll(area.height, &lines, state.scroll);
+        let cache = self.wrapped_cache(area.width);
+        let scroll = self.effective_scroll(area.height, &cache.lines, state.scroll);
         state.scroll = scroll;
 
         let start = scroll as usize;
-        let end = (scroll + area.height).min(lines.len() as u16) as usize;
-        self.render_lines_masked(area, buf, &lines, start..end, mask_char);
+        let end = (scroll + area.height).min(cache.lines.len() as u16) as usize;
+        self.render_lines_masked(area, buf, &cache.lines, start..end, mask_char);
     }
 
     /// Render the textarea with `base_style` plus additional render-only highlight ranges.
@@ -1919,26 +2090,31 @@ impl TextArea {
         base_style: Style,
         highlights: &[(Range<usize>, Style)],
     ) {
-        let lines = self.wrapped_lines(area.width);
-        let scroll = self.effective_scroll(area.height, &lines, state.scroll);
+        let cache = self.wrapped_cache(area.width);
+        let scroll = self.effective_scroll(area.height, &cache.lines, state.scroll);
         state.scroll = scroll;
 
         let start = scroll as usize;
-        let end = (scroll + area.height).min(lines.len() as u16) as usize;
-        self.render_lines(area, buf, &lines, start..end, base_style, highlights);
+        let end = (scroll + area.height).min(cache.lines.len() as u16) as usize;
+        self.render_lines(area, buf, &cache, start..end, base_style, highlights);
     }
 
     fn render_lines(
         &self,
         area: Rect,
         buf: &mut Buffer,
-        lines: &[Range<usize>],
+        cache: &WrapCache,
         range: std::ops::Range<usize>,
         base_style: Style,
         highlights: &[(Range<usize>, Style)],
     ) {
+        if self.elements.is_empty() && highlights.is_empty() {
+            Self::render_cached_lines(area, buf, cache, range, base_style);
+            return;
+        }
+
         for (row, idx) in range.enumerate() {
-            let r = &lines[idx];
+            let r = &cache.lines[idx];
             let y = area.y + row as u16;
             let line_range = r.start..r.end - 1;
             buf.set_style(Rect::new(area.x, y, area.width, 1), base_style);
@@ -1970,6 +2146,63 @@ impl TextArea {
                 let highlighted = &self.text[overlap_start..overlap_end];
                 let x_off = self.text[line_range.start..overlap_start].width() as u16;
                 buf.set_string(area.x + x_off, y, highlighted, *style);
+            }
+        }
+    }
+
+    fn render_cached_lines(
+        area: Rect,
+        buf: &mut Buffer,
+        cache: &WrapCache,
+        range: std::ops::Range<usize>,
+        base_style: Style,
+    ) {
+        if base_style == Style::default() {
+            Self::render_default_cached_lines(area, buf, cache, range);
+            return;
+        }
+
+        for (row, idx) in range.enumerate() {
+            let y = area.y + row as u16;
+            buf.set_style(Rect::new(area.x, y, area.width, 1), base_style);
+
+            for cell in &cache.rendered_lines[idx] {
+                let mut x = area.x + cell.col;
+                let next_x = x.saturating_add(cell.width);
+                if next_x > area.right() {
+                    break;
+                }
+                buf[(x, y)]
+                    .set_symbol(&cache.text[cell.range.clone()])
+                    .set_style(base_style);
+                x += 1;
+                while x < next_x {
+                    buf[(x, y)].reset();
+                    x += 1;
+                }
+            }
+        }
+    }
+
+    fn render_default_cached_lines(
+        area: Rect,
+        buf: &mut Buffer,
+        cache: &WrapCache,
+        range: std::ops::Range<usize>,
+    ) {
+        for (row, idx) in range.enumerate() {
+            let y = area.y + row as u16;
+            let row_start = buf.index_of(area.x, y);
+
+            for cell in &cache.rendered_lines[idx] {
+                let next_col = cell.col.saturating_add(cell.width);
+                if next_col > area.width {
+                    break;
+                }
+                buf.content[row_start + usize::from(cell.col)] = cell.default_cell.clone();
+                for col in cell.col + 1..next_col {
+                    buf.content[row_start + usize::from(col)].reset();
+                }
             }
         }
     }
@@ -3397,6 +3630,85 @@ mod tests {
         // After render, state.scroll should be adjusted so cursor row fits
         let effective_lines = t.desired_height(small_area.width);
         assert!(state.scroll < effective_lines);
+    }
+
+    #[test]
+    fn wrap_cache_reused_after_whole_buffer_restore() {
+        let first = "你好 世界 👍🏽 👩🏾‍💻 テスト 한글 ".repeat(160);
+        let second = "缓存 替换 👋🏻 👨🏿‍🚀 emoji 中文 ".repeat(160);
+        let mut t = ta_with(&first);
+        let first_height = t.desired_height(/*width*/ 12);
+        let first_lines = t.wrap_cache.borrow().as_ref().unwrap().lines.clone();
+
+        t.set_text_clearing_elements(&second);
+        let _ = t.desired_height(/*width*/ 12);
+        t.set_text_clearing_elements(&first);
+
+        let recent_before = t.recent_wrap_caches.borrow().len();
+        assert_eq!(t.desired_height(/*width*/ 12), first_height);
+        assert_eq!(t.wrap_cache.borrow().as_ref().unwrap().lines, first_lines);
+        assert_eq!(
+            t.recent_wrap_caches.borrow().len(),
+            recent_before.saturating_sub(1)
+        );
+    }
+
+    #[test]
+    fn warmed_wrap_cache_reused_for_whole_buffer_restore() {
+        let text = "预热 缓存 👍🏻 👩🏽‍🔬 テスト 한글 ".repeat(160);
+        let mut t = TextArea::new();
+        t.warm_recent_wrap_cache(/*width*/ 12, &text);
+        assert_eq!(t.recent_wrap_caches.borrow().len(), 1);
+
+        t.set_text_clearing_elements(&text);
+
+        let expected_lines = wrap_textarea_ranges(&text, /*width*/ 12);
+        assert_eq!(t.desired_height(/*width*/ 12), expected_lines.len() as u16);
+        assert_eq!(
+            t.wrap_cache.borrow().as_ref().unwrap().lines,
+            expected_lines
+        );
+        assert_eq!(t.recent_wrap_caches.borrow().len(), 0);
+    }
+
+    #[test]
+    fn cached_render_matches_ratatui_for_cjk_and_emoji() {
+        let text = "你好 世界 👍🏽 👩🏾‍💻 テスト 한글 cafe\u{301} \
+            line two 👋🏻 👨🏿‍🚀 mixed 中文 emoji\n"
+            .repeat(8);
+        let mut t = ta_with(&text);
+        t.set_cursor(/*pos*/ 0);
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 24, /*height*/ 20,
+        );
+        let lines = t.wrapped_lines(area.width);
+        let end = area.height.min(lines.len() as u16) as usize;
+
+        let mut expected = Buffer::empty(area);
+        for (row, idx) in (0..end).enumerate() {
+            let line_range = lines[idx].start..lines[idx].end - 1;
+            expected.set_style(
+                Rect::new(area.x, area.y + row as u16, area.width, 1),
+                Style::default(),
+            );
+            expected.set_string(
+                area.x,
+                area.y + row as u16,
+                &text[line_range],
+                Style::default(),
+            );
+        }
+        drop(lines);
+
+        let mut actual = Buffer::empty(area);
+        ratatui::widgets::StatefulWidgetRef::render_ref(
+            &(&t),
+            area,
+            &mut actual,
+            &mut TextAreaState::default(),
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
