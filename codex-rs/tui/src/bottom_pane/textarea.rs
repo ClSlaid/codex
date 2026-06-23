@@ -86,34 +86,45 @@ fn wrap_textarea_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
     )
 }
 
-fn rendered_lines_for_ranges(text: &str, lines: &[Range<usize>]) -> Vec<RenderedLine> {
-    lines
-        .iter()
-        .map(|range| {
-            let line_range = range.start..range.end - 1;
-            let mut col = 0;
-            let mut cells = Vec::new();
-            for (offset, symbol) in text[line_range.clone()].grapheme_indices(true) {
-                if symbol.contains(|ch: char| ch.is_control()) {
-                    continue;
-                }
-                let width = symbol.width() as u16;
-                if width == 0 {
-                    continue;
-                }
-                let mut default_cell = Cell::default();
-                default_cell.set_symbol(symbol);
-                cells.push(RenderedCell {
-                    col,
-                    range: line_range.start + offset..line_range.start + offset + symbol.len(),
-                    width,
-                    default_cell,
-                });
-                col = col.saturating_add(width);
-            }
-            cells
-        })
-        .collect()
+fn rendered_line_for_range(text: &str, range: &Range<usize>) -> RenderedLine {
+    let line_range = range.start..range.end - 1;
+    let mut col = 0;
+    let mut cells = Vec::new();
+    for (offset, symbol) in text[line_range.clone()].grapheme_indices(true) {
+        if symbol.contains(|ch: char| ch.is_control()) {
+            continue;
+        }
+        let width = symbol.width() as u16;
+        if width == 0 {
+            continue;
+        }
+        let mut default_cell = Cell::default();
+        default_cell.set_symbol(symbol);
+        cells.push(RenderedCell {
+            col,
+            range: line_range.start + offset..line_range.start + offset + symbol.len(),
+            width,
+            default_cell,
+        });
+        col = col.saturating_add(width);
+    }
+    cells
+}
+
+fn lazy_rendered_lines_for_ranges(lines: &[Range<usize>]) -> RefCell<Vec<Option<RenderedLine>>> {
+    RefCell::new(vec![None; lines.len()])
+}
+
+fn prepared_rendered_lines_for_ranges(
+    text: &str,
+    lines: &[Range<usize>],
+) -> RefCell<Vec<Option<RenderedLine>>> {
+    RefCell::new(
+        lines
+            .iter()
+            .map(|range| Some(rendered_line_for_range(text, range)))
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +175,7 @@ struct WrapCache {
     generation: u64,
     text: String,
     lines: Vec<Range<usize>>,
-    rendered_lines: Vec<RenderedLine>,
+    rendered_lines: RefCell<Vec<Option<RenderedLine>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,25 +264,24 @@ impl TextArea {
         }
 
         let lines = wrap_textarea_ranges(text, width);
-        let rendered_lines = rendered_lines_for_ranges(text, &lines);
         self.remember_wrap_cache(WrapCache {
             width,
             generation: 0,
             text: text.to_string(),
+            rendered_lines: lazy_rendered_lines_for_ranges(&lines),
             lines,
-            rendered_lines,
         });
     }
 
     pub(crate) fn prepare_wrap_cache(width: u16, text: String) -> PreparedWrapCache {
         let lines = wrap_textarea_ranges(&text, width);
-        let rendered_lines = rendered_lines_for_ranges(&text, &lines);
+        let rendered_lines = prepared_rendered_lines_for_ranges(&text, &lines);
         PreparedWrapCache(WrapCache {
             width,
             generation: 0,
             text,
-            lines,
             rendered_lines,
+            lines,
         })
     }
 
@@ -1979,13 +1989,12 @@ impl TextArea {
                     *cache = Some(reused);
                 } else {
                     let lines = wrap_textarea_ranges(&self.text, width);
-                    let rendered_lines = rendered_lines_for_ranges(&self.text, &lines);
                     *cache = Some(WrapCache {
                         width,
                         generation: self.generation,
                         text: self.text.clone(),
+                        rendered_lines: lazy_rendered_lines_for_ranges(&lines),
                         lines,
-                        rendered_lines,
                     });
                 }
             }
@@ -2166,7 +2175,11 @@ impl TextArea {
             let y = area.y + row as u16;
             buf.set_style(Rect::new(area.x, y, area.width, 1), base_style);
 
-            for cell in &cache.rendered_lines[idx] {
+            let mut rendered_lines = cache.rendered_lines.borrow_mut();
+            let rendered_line = rendered_lines[idx]
+                .get_or_insert_with(|| rendered_line_for_range(&cache.text, &cache.lines[idx]));
+
+            for cell in rendered_line.iter() {
                 let mut x = area.x + cell.col;
                 let next_x = x.saturating_add(cell.width);
                 if next_x > area.right() {
@@ -2194,7 +2207,11 @@ impl TextArea {
             let y = area.y + row as u16;
             let row_start = buf.index_of(area.x, y);
 
-            for cell in &cache.rendered_lines[idx] {
+            let mut rendered_lines = cache.rendered_lines.borrow_mut();
+            let rendered_line = rendered_lines[idx]
+                .get_or_insert_with(|| rendered_line_for_range(&cache.text, &cache.lines[idx]));
+
+            for cell in rendered_line.iter() {
                 let next_col = cell.col.saturating_add(cell.width);
                 if next_col > area.width {
                     break;
@@ -3669,6 +3686,52 @@ mod tests {
             expected_lines
         );
         assert_eq!(t.recent_wrap_caches.borrow().len(), 0);
+    }
+
+    #[test]
+    fn warmed_wrap_cache_renders_lines_lazily() {
+        let text = "预热 cache 👍🏻 👩🏽‍🔬 ASCII path /tmp/demo テスト 한글 ".repeat(160);
+        let mut t = TextArea::new();
+        t.warm_recent_wrap_cache(/*width*/ 12, &text);
+        assert!(
+            wrap_textarea_ranges(&text, /*width*/ 12).len() > 3,
+            "test input should wrap beyond the visible area",
+        );
+        assert!(
+            t.recent_wrap_caches.borrow()[0]
+                .rendered_lines
+                .borrow()
+                .iter()
+                .all(Option::is_none)
+        );
+
+        t.set_text_clearing_elements(&text);
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 12, /*height*/ 3,
+        );
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::StatefulWidgetRef::render_ref(
+            &(&t),
+            area,
+            &mut buf,
+            &mut TextAreaState::default(),
+        );
+
+        let cache = t.wrap_cache.borrow();
+        let rendered_lines = cache.as_ref().unwrap().rendered_lines.borrow();
+        assert_eq!(
+            rendered_lines
+                .iter()
+                .filter(|rendered_line| rendered_line.is_some())
+                .count(),
+            usize::from(area.height),
+        );
+        assert!(
+            rendered_lines
+                .iter()
+                .skip(usize::from(area.height))
+                .any(Option::is_none)
+        );
     }
 
     #[test]
