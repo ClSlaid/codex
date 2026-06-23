@@ -398,6 +398,7 @@ pub(crate) struct ChatComposer {
     history_search_next_keys: Vec<KeyBinding>,
     editor_keymap: EditorKeymap,
     vim_normal_keymap: VimNormalKeymap,
+    dense_render_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -568,6 +569,7 @@ impl ChatComposer {
             history_search_next_keys: default_keymap.composer.history_search_next.clone(),
             editor_keymap: default_editor_keymap,
             vim_normal_keymap: default_vim_normal_keymap,
+            dense_render_pending: false,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -576,6 +578,10 @@ impl ChatComposer {
 
     pub(crate) fn set_frame_requester(&mut self, frame_requester: FrameRequester) {
         self.frame_requester = Some(frame_requester);
+    }
+
+    pub(crate) fn take_dense_render_pending(&mut self) -> bool {
+        std::mem::take(&mut self.dense_render_pending)
     }
 
     pub fn set_skill_mentions(&mut self, skills: Option<Vec<SkillMetadata>>) {
@@ -1601,6 +1607,7 @@ impl ChatComposer {
         );
         self.set_pending_pastes(pending_pastes);
         self.move_cursor_to_history_entry_end();
+        self.dense_render_pending = true;
     }
 
     pub(crate) fn text_elements(&self) -> Vec<TextElement> {
@@ -4253,6 +4260,12 @@ impl Renderable for ChatComposer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TextareaRenderMode {
+    Normal,
+    DenseRender,
+}
+
 impl ChatComposer {
     pub(crate) fn desired_height_with_textarea_right_reserve(
         &self,
@@ -4302,6 +4315,38 @@ impl ChatComposer {
         buf: &mut Buffer,
         mask_char: Option<char>,
         textarea_right_reserve: u16,
+    ) {
+        self.render_with_mask_and_textarea_right_reserve_mode(
+            area,
+            buf,
+            mask_char,
+            textarea_right_reserve,
+            TextareaRenderMode::Normal,
+        );
+    }
+
+    pub(crate) fn render_dense_with_textarea_right_reserve(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        textarea_right_reserve: u16,
+    ) {
+        self.render_with_mask_and_textarea_right_reserve_mode(
+            area,
+            buf,
+            /*mask_char*/ None,
+            textarea_right_reserve,
+            TextareaRenderMode::DenseRender,
+        );
+    }
+
+    fn render_with_mask_and_textarea_right_reserve_mode(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        mask_char: Option<char>,
+        textarea_right_reserve: u16,
+        textarea_render_mode: TextareaRenderMode,
     ) {
         let [composer_rect, remote_images_rect, textarea_rect, popup_rect] =
             self.layout_areas_with_textarea_right_reserve(area, textarea_right_reserve);
@@ -4551,7 +4596,14 @@ impl ChatComposer {
             }
         }
         let style = user_message_style();
-        Block::default().style(style).render_ref(composer_rect, buf);
+        match textarea_render_mode {
+            TextareaRenderMode::Normal => {
+                Block::default().style(style).render_ref(composer_rect, buf)
+            }
+            TextareaRenderMode::DenseRender => {
+                render_composer_style_except_textarea(composer_rect, textarea_rect, style, buf);
+            }
+        }
         if !remote_images_rect.is_empty() {
             Paragraph::new(self.attachments.remote_image_lines())
                 .style(style)
@@ -4592,12 +4644,18 @@ impl ChatComposer {
                         .map(|range| (range, search_highlight_style)),
                 );
                 if highlights.is_empty() {
-                    StatefulWidgetRef::render_ref(
-                        &(&self.draft.textarea),
-                        textarea_rect,
-                        buf,
-                        &mut state,
-                    );
+                    match textarea_render_mode {
+                        TextareaRenderMode::Normal => StatefulWidgetRef::render_ref(
+                            &(&self.draft.textarea),
+                            textarea_rect,
+                            buf,
+                            &mut state,
+                        ),
+                        TextareaRenderMode::DenseRender => self
+                            .draft
+                            .textarea
+                            .render_ref_into_cleared_area(textarea_rect, buf, &mut state),
+                    }
                 } else {
                     self.draft.textarea.render_ref_styled_with_highlights(
                         textarea_rect,
@@ -4625,6 +4683,56 @@ impl ChatComposer {
                     .render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
             }
         }
+    }
+}
+
+fn render_composer_style_except_textarea(
+    composer_rect: Rect,
+    textarea_rect: Rect,
+    style: Style,
+    buf: &mut Buffer,
+) {
+    if textarea_rect.is_empty() {
+        buf.set_style(composer_rect, style);
+        return;
+    }
+
+    let top = textarea_rect.y.saturating_sub(composer_rect.y);
+    if top > 0 {
+        buf.set_style(
+            Rect::new(composer_rect.x, composer_rect.y, composer_rect.width, top),
+            style,
+        );
+    }
+
+    let left = textarea_rect.x.saturating_sub(composer_rect.x);
+    if left > 0 {
+        buf.set_style(
+            Rect::new(composer_rect.x, textarea_rect.y, left, textarea_rect.height),
+            style,
+        );
+    }
+
+    let right = composer_rect.right().saturating_sub(textarea_rect.right());
+    if right > 0 {
+        buf.set_style(
+            Rect::new(
+                textarea_rect.right(),
+                textarea_rect.y,
+                right,
+                textarea_rect.height,
+            ),
+            style,
+        );
+    }
+
+    let bottom_y = textarea_rect.bottom();
+    let bottom = composer_rect.bottom().saturating_sub(bottom_y);
+    if bottom > 0 {
+        buf.set_style(
+            Rect::new(composer_rect.x, bottom_y, composer_rect.width, bottom),
+            style,
+        );
     }
 }
 
@@ -11360,6 +11468,7 @@ mod tests {
     #[test]
     #[ignore]
     fn history_recall_latency_100x8k_ab() {
+        use crate::custom_terminal::FrameFlush;
         use crate::custom_terminal::Terminal;
         use crate::custom_terminal::TerminalDrawTimings;
         use ratatui::backend::Backend;
@@ -11373,11 +11482,14 @@ mod tests {
         use std::time::Instant;
 
         const RECALL_SAMPLES: usize = 9 * 240;
+        const TERMINAL_PROFILED_TIMER_COUNT: usize = 6;
+        const RECALL_SAMPLE_TIMER_COUNT: usize = 3 + TERMINAL_PROFILED_TIMER_COUNT;
 
         #[derive(Clone, Copy)]
         struct RecallSample {
             desired_height: Duration,
             handle_key: Duration,
+            repaint_rows: Duration,
             draw: TerminalDrawTimings,
             total: Duration,
             bytes_written: usize,
@@ -11546,6 +11658,8 @@ mod tests {
             let area = Rect::new(
                 /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
             );
+            let initial_repaint_height = composer.desired_height(area.width).min(area.height);
+            let mut previous_repaint_top = area.bottom().saturating_sub(initial_repaint_height);
             for key in recall_keys() {
                 let bytes_before = terminal.backend().bytes_written;
                 let total_start = Instant::now();
@@ -11556,13 +11670,39 @@ mod tests {
                 let started = Instant::now();
                 let _ = composer.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
                 let handle_key = started.elapsed();
+                let started = Instant::now();
+                let repaint_rows = composer.take_dense_render_pending().then(|| {
+                    let repaint_height = composer.desired_height(area.width).min(area.height);
+                    let repaint_top = area.bottom().saturating_sub(repaint_height);
+                    let top = previous_repaint_top.min(repaint_top);
+                    previous_repaint_top = repaint_top;
+                    top..area.bottom()
+                });
+                let repaint_rows_duration = started.elapsed();
 
                 let draw = terminal
-                    .draw_profiled(|frame| composer.render(frame.area(), frame.buffer_mut()))
+                    .draw_profiled(|frame| {
+                        match repaint_rows.clone() {
+                            Some(rows) => {
+                                frame.clear_rows(rows.clone());
+                                composer.render_dense_with_textarea_right_reserve(
+                                    frame.area(),
+                                    frame.buffer_mut(),
+                                    /*textarea_right_reserve*/ 0,
+                                );
+                                FrameFlush::Dense(rows)
+                            }
+                            None => {
+                                composer.render(frame.area(), frame.buffer_mut());
+                                FrameFlush::Sparse
+                            }
+                        }
+                    })
                     .unwrap();
                 samples.push(RecallSample {
                     desired_height,
                     handle_key,
+                    repaint_rows: repaint_rows_duration,
                     draw,
                     total: total_start.elapsed(),
                     bytes_written: terminal.backend().bytes_written - bytes_before,
@@ -11571,10 +11711,14 @@ mod tests {
             samples
         }
 
-        fn measure_probe_overhead() -> Vec<Duration> {
+        fn measure_nested_probe_overhead(measurements: usize) -> Vec<Duration> {
             let mut samples = Vec::with_capacity(RECALL_SAMPLES);
             for _ in 0..RECALL_SAMPLES {
                 let total_start = Instant::now();
+                for _ in 0..measurements {
+                    let started = Instant::now();
+                    let _ = started.elapsed();
+                }
                 samples.push(total_start.elapsed());
             }
             samples
@@ -11629,14 +11773,20 @@ mod tests {
             ));
         }
 
-        fn print_recall_summary(label: &str, samples: &[RecallSample], probe_overhead: Duration) {
+        fn print_recall_summary(
+            label: &str,
+            samples: &[RecallSample],
+            phase_probe_overhead: Duration,
+            terminal_probe_overhead: Duration,
+            recall_probe_overhead: Duration,
+        ) {
             print_duration_summary(
                 &format!("{label}.total"),
                 &samples
                     .iter()
                     .map(|sample| sample.total)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                recall_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.desired_height"),
@@ -11644,7 +11794,7 @@ mod tests {
                     .iter()
                     .map(|sample| sample.desired_height)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.handle_key"),
@@ -11652,7 +11802,7 @@ mod tests {
                     .iter()
                     .map(|sample| sample.handle_key)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.terminal_total"),
@@ -11660,7 +11810,15 @@ mod tests {
                     .iter()
                     .map(|sample| sample.draw.total)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                terminal_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.repaint_rows"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.repaint_rows)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.terminal_autoresize"),
@@ -11668,7 +11826,7 @@ mod tests {
                     .iter()
                     .map(|sample| sample.draw.autoresize)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.terminal_render"),
@@ -11676,7 +11834,7 @@ mod tests {
                     .iter()
                     .map(|sample| sample.draw.render)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.terminal_diff"),
@@ -11684,7 +11842,7 @@ mod tests {
                     .iter()
                     .map(|sample| sample.draw.diff)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.terminal_encode"),
@@ -11692,7 +11850,7 @@ mod tests {
                     .iter()
                     .map(|sample| sample.draw.encode)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.terminal_cursor"),
@@ -11700,7 +11858,15 @@ mod tests {
                     .iter()
                     .map(|sample| sample.draw.cursor)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_buffer_swap"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.buffer_swap)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
             );
             print_duration_summary(
                 &format!("{label}.terminal_backend_flush"),
@@ -11708,7 +11874,7 @@ mod tests {
                     .iter()
                     .map(|sample| sample.draw.backend_flush)
                     .collect::<Vec<_>>(),
-                probe_overhead,
+                phase_probe_overhead,
             );
             print_usize_summary(
                 &format!("{label}.terminal_commands"),
@@ -11733,9 +11899,29 @@ mod tests {
         emit_result(format_args!(
             "RESULT pr_prewarm_ready count={prewarm_ready}"
         ));
-        let probe_overhead_samples = measure_probe_overhead();
-        let probe_overhead = median(&probe_overhead_samples);
-        print_duration_summary("probe_overhead", &probe_overhead_samples, Duration::ZERO);
+        let phase_probe_overhead_samples = measure_nested_probe_overhead(0);
+        let phase_probe_overhead = median(&phase_probe_overhead_samples);
+        print_duration_summary(
+            "probe_overhead.phase",
+            &phase_probe_overhead_samples,
+            Duration::ZERO,
+        );
+        let terminal_probe_overhead_samples =
+            measure_nested_probe_overhead(TERMINAL_PROFILED_TIMER_COUNT);
+        let terminal_probe_overhead = median(&terminal_probe_overhead_samples);
+        print_duration_summary(
+            "probe_overhead.terminal_sample",
+            &terminal_probe_overhead_samples,
+            Duration::ZERO,
+        );
+        let recall_probe_overhead_samples =
+            measure_nested_probe_overhead(RECALL_SAMPLE_TIMER_COUNT);
+        let recall_probe_overhead = median(&recall_probe_overhead_samples);
+        print_duration_summary(
+            "probe_overhead.recall_sample",
+            &recall_probe_overhead_samples,
+            Duration::ZERO,
+        );
         let mut terminal =
             Terminal::with_options(BenchmarkBackend::new(/*width*/ 80, /*height*/ 48))
                 .expect("terminal");
@@ -11747,12 +11933,16 @@ mod tests {
         print_recall_summary(
             "pr_prewarmed_custom_minimal_initial",
             &initial,
-            probe_overhead,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
         );
         print_recall_summary(
             "pr_prewarmed_custom_minimal_repeat",
             &repeat,
-            probe_overhead,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
         );
     }
 }

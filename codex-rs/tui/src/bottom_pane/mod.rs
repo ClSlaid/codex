@@ -873,6 +873,10 @@ impl BottomPane {
         self.composer.input_enabled()
     }
 
+    pub(crate) fn take_dense_composer_render_pending(&mut self) -> bool {
+        self.composer.take_dense_render_pending()
+    }
+
     pub(crate) fn composer_pending_pastes(&self) -> Vec<(String, String)> {
         self.composer.pending_pastes()
     }
@@ -1685,12 +1689,26 @@ impl BottomPane {
     }
 
     fn as_renderable(&'_ self) -> RenderableItem<'_> {
-        self.as_renderable_with_composer_right_reserve(/*composer_right_reserve*/ 0)
+        self.as_renderable_with_composer_right_reserve_and_mode(
+            /*composer_right_reserve*/ 0,
+            ComposerRenderMode::Normal,
+        )
     }
 
     fn as_renderable_with_composer_right_reserve(
         &'_ self,
         composer_right_reserve: u16,
+    ) -> RenderableItem<'_> {
+        self.as_renderable_with_composer_right_reserve_and_mode(
+            composer_right_reserve,
+            ComposerRenderMode::Normal,
+        )
+    }
+
+    fn as_renderable_with_composer_right_reserve_and_mode(
+        &'_ self,
+        composer_right_reserve: u16,
+        composer_render_mode: ComposerRenderMode,
     ) -> RenderableItem<'_> {
         if let Some(view) = self.active_view() {
             RenderableItem::Borrowed(view)
@@ -1733,12 +1751,15 @@ impl BottomPane {
             }
             let mut flex2 = FlexRenderable::new();
             flex2.push(/*flex*/ 1, RenderableItem::Owned(flex.into()));
-            let composer: RenderableItem<'_> = if composer_right_reserve == 0 {
+            let composer: RenderableItem<'_> = if composer_right_reserve == 0
+                && composer_render_mode == ComposerRenderMode::Normal
+            {
                 RenderableItem::Borrowed(&self.composer)
             } else {
                 RenderableItem::Owned(Box::new(ChatComposerRightReserveRenderable {
                     composer: &self.composer,
                     right_reserve: composer_right_reserve,
+                    render_mode: composer_render_mode,
                 }))
             };
             flex2.push(/*flex*/ 0, composer);
@@ -1754,6 +1775,19 @@ impl BottomPane {
     ) {
         self.as_renderable_with_composer_right_reserve(composer_right_reserve)
             .render(area, buf);
+    }
+
+    pub(crate) fn render_dense_with_composer_right_reserve(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        composer_right_reserve: u16,
+    ) {
+        self.as_renderable_with_composer_right_reserve_and_mode(
+            composer_right_reserve,
+            ComposerRenderMode::DenseRender,
+        )
+        .render(area, buf);
     }
 
     pub(crate) fn desired_height_with_composer_right_reserve(
@@ -1818,19 +1852,33 @@ impl BottomPane {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComposerRenderMode {
+    Normal,
+    DenseRender,
+}
+
 struct ChatComposerRightReserveRenderable<'a> {
     composer: &'a chat_composer::ChatComposer,
     right_reserve: u16,
+    render_mode: ComposerRenderMode,
 }
 
 impl Renderable for ChatComposerRightReserveRenderable<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.composer.render_with_mask_and_textarea_right_reserve(
-            area,
-            buf,
-            /*mask_char*/ None,
-            self.right_reserve,
-        );
+        match self.render_mode {
+            ComposerRenderMode::Normal => {
+                self.composer.render_with_mask_and_textarea_right_reserve(
+                    area,
+                    buf,
+                    /*mask_char*/ None,
+                    self.right_reserve,
+                )
+            }
+            ComposerRenderMode::DenseRender => self
+                .composer
+                .render_dense_with_textarea_right_reserve(area, buf, self.right_reserve),
+        }
     }
 
     fn desired_height(&self, width: u16) -> u16 {
