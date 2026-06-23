@@ -154,6 +154,7 @@ use ratatui::widgets::Block;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
+use std::borrow::Cow;
 
 use super::chat_composer_history::ChatComposerHistory;
 use super::chat_composer_history::HistoryEntry;
@@ -236,6 +237,7 @@ use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::textarea::PreparedWrapCache;
 use crate::bottom_pane::textarea::TextArea;
+use crate::bottom_pane::textarea::TextAreaHistoryCacheKey;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
@@ -250,8 +252,7 @@ use codex_file_search::FileMatch;
 #[cfg(test)]
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
-use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::Cell as StdCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -361,8 +362,9 @@ pub(crate) struct ChatComposer {
     history: ChatComposerHistory,
     footer: FooterState,
     has_focus: bool,
-    last_textarea_width: Cell<Option<u16>>,
-    history_prewarm_due_at: Cell<Option<Instant>>,
+    last_textarea_width: StdCell<Option<u16>>,
+    history_prewarm_due_at: StdCell<Option<Instant>>,
+    pending_history_render_cache_prewarms: HashSet<(TextAreaHistoryCacheKey, u16)>,
     frame_requester: Option<FrameRequester>,
     attachments: AttachmentState,
     placeholder_text: String,
@@ -531,8 +533,9 @@ impl ChatComposer {
                 reasoning_up_key: primary_binding(&default_keymap.chat.increase_reasoning_effort),
             },
             has_focus: has_input_focus,
-            last_textarea_width: Cell::new(None),
-            history_prewarm_due_at: Cell::new(None),
+            last_textarea_width: StdCell::new(None),
+            history_prewarm_due_at: StdCell::new(None),
+            pending_history_render_cache_prewarms: HashSet::new(),
             frame_requester: None,
             attachments: AttachmentState::default(),
             placeholder_text,
@@ -594,9 +597,6 @@ impl ChatComposer {
     }
 
     pub fn set_mentions_v2_enabled(&mut self, enabled: bool) {
-        if self.mentions_v2_enabled != enabled {
-            self.reset_history_prewarm_schedule();
-        }
         self.mentions_v2_enabled = enabled;
         self.history.set_at_mention_restore_enabled(enabled);
         self.sync_popups();
@@ -848,34 +848,71 @@ impl ChatComposer {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
-        prewarmed_wrap_cache: Option<PreparedWrapCache>,
     ) -> bool {
-        let prewarm_width = prewarmed_wrap_cache.as_ref().map(PreparedWrapCache::width);
-        match self.history.on_entry_response(
-            log_id,
-            offset,
-            entry,
-            prewarm_width,
-            &self.app_event_tx,
-        ) {
+        match self
+            .history
+            .on_entry_response(log_id, offset, entry, &self.app_event_tx)
+        {
             HistoryEntryResponse::Found(entry) => {
-                self.remember_current_width_wrap_cache(prewarmed_wrap_cache);
                 // Persistent ↑/↓ history is text-only (backwards-compatible and avoids persisting
                 // attachments), but local in-session ↑/↓ history can rehydrate elements and image paths.
                 self.apply_history_entry(entry);
                 true
             }
             HistoryEntryResponse::Search(result) => {
-                self.remember_current_width_wrap_cache(prewarmed_wrap_cache);
                 self.apply_history_search_result(result);
                 true
             }
-            HistoryEntryResponse::Prewarmed => {
-                self.remember_current_width_wrap_cache(prewarmed_wrap_cache);
-                false
-            }
             HistoryEntryResponse::Ignored => false,
         }
+    }
+
+    pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
+        if let Some(entry) = self.history.record_replayed_submission_for_recall(entry) {
+            self.schedule_history_entry_render_cache_prewarm(&entry);
+        }
+    }
+
+    fn record_local_history_entry(&mut self, entry: HistoryEntry) {
+        if let Some(entry) = self.history.record_local_submission_for_recall(entry) {
+            self.schedule_history_entry_render_cache_prewarm(&entry);
+        }
+    }
+
+    fn schedule_history_entry_render_cache_prewarm(&mut self, entry: &HistoryEntry) {
+        let Some(thread_id) = self.history.thread_id() else {
+            return;
+        };
+        let Some(width) = self.last_textarea_width.get() else {
+            return;
+        };
+        if !TextArea::cacheable_text(&entry.text) {
+            return;
+        }
+        let Some(key) = entry.cache_key else {
+            return;
+        };
+        if !self
+            .pending_history_render_cache_prewarms
+            .insert((key, width))
+        {
+            return;
+        }
+        self.app_event_tx
+            .send(AppEvent::PrewarmHistoryEntryRenderCache {
+                thread_id,
+                key,
+                width,
+                text: entry.text.to_string(),
+            });
+    }
+
+    pub(crate) fn remember_history_entry_render_cache(&mut self, cache: PreparedWrapCache) {
+        if let Some(key) = cache.key() {
+            self.pending_history_render_cache_prewarms
+                .remove(&(key, cache.width()));
+        }
+        self.remember_current_width_wrap_cache(Some(cache));
     }
 
     fn remember_current_width_wrap_cache(&self, cache: Option<PreparedWrapCache>) {
@@ -885,25 +922,6 @@ impl ChatComposer {
         if self.last_textarea_width.get() == Some(cache.width()) {
             self.draft.textarea.remember_prepared_wrap_cache(cache);
         }
-    }
-
-    pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
-        self.warm_history_entry_for_recall(&entry);
-        self.history.record_replayed_submission(entry);
-    }
-
-    fn record_local_history_entry(&mut self, entry: HistoryEntry) {
-        self.warm_history_entry_for_recall(&entry);
-        self.history.record_local_submission(entry);
-    }
-
-    fn warm_history_entry_for_recall(&self, entry: &HistoryEntry) {
-        let Some(width) = self.last_textarea_width.get() else {
-            return;
-        };
-        self.draft
-            .textarea
-            .warm_recent_wrap_cache(width, &entry.text);
     }
 
     pub(crate) fn schedule_history_cache_prewarm_at(&mut self, now: Instant) {
@@ -923,6 +941,12 @@ impl ChatComposer {
         self.history.set_prewarm_width(width);
         self.history
             .schedule_recent_prewarm(HISTORY_RECALL_PREWARM_LIMIT, &self.app_event_tx);
+        for entry in self
+            .history
+            .recent_local_history_entries(HISTORY_RECALL_PREWARM_LIMIT)
+        {
+            self.schedule_history_entry_render_cache_prewarm(&entry);
+        }
         self.history_prewarm_due_at.set(None);
     }
 
@@ -1048,7 +1072,7 @@ impl ChatComposer {
     /// remote images). Cursor is placed at the end after rebuilding elements.
     pub(crate) fn apply_external_edit(&mut self, text: String) {
         self.draft.pending_pastes.clear();
-        let (text, _) = self.imported_text_for_textarea(text, Vec::new());
+        let (text, _) = self.imported_text_for_textarea(&text, Vec::new());
 
         // Count placeholder occurrences in the new text.
         let mut placeholder_counts: HashMap<String, usize> = HashMap::new();
@@ -1325,6 +1349,23 @@ impl ChatComposer {
         local_image_paths: Vec<PathBuf>,
         mention_bindings: Vec<MentionBinding>,
     ) {
+        self.set_text_content_with_mention_bindings_inner(
+            &text,
+            text_elements,
+            local_image_paths,
+            mention_bindings,
+            /*history_cache_key*/ None,
+        );
+    }
+
+    fn set_text_content_with_mention_bindings_inner(
+        &mut self,
+        text: &str,
+        text_elements: Vec<TextElement>,
+        local_image_paths: Vec<PathBuf>,
+        mention_bindings: Vec<MentionBinding>,
+        history_cache_key: Option<TextAreaHistoryCacheKey>,
+    ) {
         // Clear any existing content, placeholders, and attachments first.
         self.draft.textarea.set_text_clearing_elements("");
         self.draft.is_bash_mode = false;
@@ -1332,9 +1373,17 @@ impl ChatComposer {
         self.draft.mention_bindings.clear();
 
         let (text, text_elements) = self.imported_text_for_textarea(text, text_elements);
-        self.draft
-            .textarea
-            .set_text_with_elements(&text, &text_elements);
+        if let Some(history_cache_key) = history_cache_key {
+            self.draft.textarea.set_text_with_history_cache_key(
+                &text,
+                &text_elements,
+                history_cache_key,
+            );
+        } else {
+            self.draft
+                .textarea
+                .set_text_with_elements(&text, &text_elements);
+        }
         self.attachments
             .reset_local_images(local_image_paths, &mut self.draft.textarea);
 
@@ -1461,15 +1510,15 @@ impl ChatComposer {
     ///
     /// Shell mode stores the leading `!` as prompt state instead of editable text,
     /// so full-buffer imports must absorb that prefix before rebuilding the textarea.
-    fn imported_text_for_textarea(
+    fn imported_text_for_textarea<'a>(
         &mut self,
-        text: String,
+        text: &'a str,
         text_elements: Vec<TextElement>,
-    ) -> (String, Vec<TextElement>) {
+    ) -> (Cow<'a, str>, Vec<TextElement>) {
         if let Some(stripped) = text.strip_prefix('!') {
             self.draft.is_bash_mode = true;
             (
-                stripped.to_string(),
+                Cow::Borrowed(stripped),
                 text_elements
                     .into_iter()
                     .filter_map(|element| Self::shift_text_element(element, /*shift*/ -1))
@@ -1477,7 +1526,7 @@ impl ChatComposer {
             )
         } else {
             self.draft.is_bash_mode = false;
-            (text, text_elements)
+            (Cow::Borrowed(text), text_elements)
         }
     }
 
@@ -1495,7 +1544,8 @@ impl ChatComposer {
         self.attachments.clear_remote_image_urls();
         self.history.reset_navigation();
         self.record_local_history_entry(HistoryEntry {
-            text: previous.clone(),
+            cache_key: None,
+            text: previous.clone().into(),
             text_elements,
             local_image_paths,
             remote_image_urls,
@@ -1514,12 +1564,14 @@ impl ChatComposer {
         }
     }
 
-    fn current_text_for_history_navigation(&self) -> Cow<'_, str> {
-        if self.draft.is_bash_mode {
-            Cow::Owned(self.current_text())
-        } else {
-            Cow::Borrowed(self.draft.textarea.text())
-        }
+    fn should_handle_history_navigation(&self) -> bool {
+        let cursor = self.history_navigation_cursor();
+        let text_len = self.current_text_len();
+        self.history.should_handle_navigation(
+            text_len == 0,
+            self.draft.textarea.history_cache_key(),
+            cursor == 0 || cursor == text_len,
+        )
     }
 
     /// Rehydrate a history entry into the composer with shell-like cursor placement.
@@ -1531,6 +1583,7 @@ impl ChatComposer {
     /// treats interior positions as normal editing mode.
     fn apply_history_entry(&mut self, entry: HistoryEntry) {
         let HistoryEntry {
+            cache_key,
             text,
             text_elements,
             local_image_paths,
@@ -1539,11 +1592,12 @@ impl ChatComposer {
             pending_pastes,
         } = entry;
         self.set_remote_image_urls(remote_image_urls);
-        self.set_text_content_with_mention_bindings(
-            text,
+        self.set_text_content_with_mention_bindings_inner(
+            &text,
             text_elements,
             local_image_paths,
             mention_bindings,
+            cache_key,
         );
         self.set_pending_pastes(pending_pastes);
         self.move_cursor_to_history_entry_end();
@@ -2829,7 +2883,8 @@ impl ChatComposer {
         self.draft.recent_submission_mention_bindings = original_mention_bindings.clone();
         if record_history && (!text.is_empty() || !self.attachments.is_empty()) {
             self.record_local_history_entry(HistoryEntry {
-                text: text.clone(),
+                cache_key: None,
+                text: text.clone().into(),
                 text_elements: text_elements.clone(),
                 local_image_paths: self.attachments.local_image_paths(),
                 remote_image_urls: self.attachments.remote_image_urls(),
@@ -3123,7 +3178,8 @@ impl ChatComposer {
     /// workflows start carrying those through in the future.
     fn stage_slash_command_history_text(&mut self, text: String) {
         self.pending_slash_command_history = Some(HistoryEntry {
-            text,
+            cache_key: None,
+            text: text.into(),
             text_elements: self.draft.textarea.text_elements(),
             local_image_paths: self.attachments.local_image_paths(),
             remote_image_urls: self.attachments.remote_image_urls(),
@@ -3253,12 +3309,7 @@ impl ChatComposer {
             )
         };
         if history_up_pressed || history_down_pressed {
-            let should_navigate_history = {
-                let text = self.current_text_for_history_navigation();
-                self.history
-                    .should_handle_navigation(text.as_ref(), self.history_navigation_cursor())
-            };
-            if should_navigate_history {
+            if self.should_handle_history_navigation() {
                 let replace_entry = if history_up_pressed {
                     self.history.navigate_up(&self.app_event_tx)
                 } else {
@@ -3633,10 +3684,7 @@ impl ChatComposer {
         } else {
             self.current_editable_at_token()
         };
-        let browsing_history = self.history.should_handle_navigation(
-            self.current_text_for_history_navigation().as_ref(),
-            self.history_navigation_cursor(),
-        );
+        let browsing_history = self.should_handle_history_navigation();
         // When browsing input history (shell-style Up/Down recall), skip all popup
         // synchronization so nothing steals focus from continued history navigation.
         if browsing_history {
@@ -4654,61 +4702,6 @@ mod tests {
             "",
             "expected blank spacing row above hints but saw: {spacing_row:?}",
         );
-    }
-
-    #[test]
-    fn history_prewarm_debounces_width_changes() {
-        let (tx, mut rx) = unbounded_channel::<AppEvent>();
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            AppEventSender::new(tx),
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        composer.set_history_metadata(ThreadId::new(), /*log_id*/ 7, /*entry_count*/ 2);
-
-        composer.observe_textarea_width(80);
-        composer.schedule_history_cache_prewarm_at(
-            composer
-                .history_prewarm_due_at
-                .get()
-                .expect("prewarm should be due"),
-        );
-        for _ in 0..2 {
-            assert!(rx.try_recv().is_ok());
-        }
-        assert!(rx.try_recv().is_err());
-
-        composer.observe_textarea_width(100);
-        let first_due_at = composer
-            .history_prewarm_due_at
-            .get()
-            .expect("resize prewarm should be delayed");
-        composer
-            .schedule_history_cache_prewarm_at(first_due_at - Duration::from_millis(/*millis*/ 1));
-        assert!(rx.try_recv().is_err());
-
-        composer.observe_textarea_width(120);
-        let second_due_at = composer
-            .history_prewarm_due_at
-            .get()
-            .expect("second resize prewarm should be delayed");
-        assert!(rx.try_recv().is_err());
-
-        composer.schedule_history_cache_prewarm_at(first_due_at);
-        assert!(rx.try_recv().is_err());
-
-        composer.schedule_history_cache_prewarm_at(second_due_at);
-        for _ in 0..2 {
-            let AppEvent::LookupMessageHistoryEntry { prewarm, .. } =
-                rx.try_recv().expect("expected debounced prewarm")
-            else {
-                panic!("unexpected event variant");
-            };
-            assert_eq!(prewarm.expect("prewarm request").width, 120);
-        }
-        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -11362,5 +11355,240 @@ mod tests {
             .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap();
         insta::assert_snapshot!("shutdown_in_progress", terminal.backend());
+    }
+
+    #[test]
+    #[ignore]
+    fn history_recall_latency_100x8k_ab() {
+        use crate::custom_terminal::Terminal;
+        use ratatui::backend::Backend;
+        use ratatui::backend::ClearType;
+        use ratatui::backend::WindowSize;
+        use ratatui::layout::Position;
+        use ratatui::layout::Size;
+        use std::io;
+        use std::io::Write;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        const RECALL_SAMPLES: usize = 9 * 24;
+
+        struct BenchmarkBackend {
+            size: Size,
+            cursor: Position,
+            bytes_written: usize,
+        }
+
+        impl BenchmarkBackend {
+            fn new(width: u16, height: u16) -> Self {
+                Self {
+                    size: Size { width, height },
+                    cursor: Position { x: 0, y: 0 },
+                    bytes_written: 0,
+                }
+            }
+        }
+
+        impl Write for BenchmarkBackend {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.bytes_written += buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Backend for BenchmarkBackend {
+            fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+            where
+                I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+            {
+                Ok(())
+            }
+
+            fn hide_cursor(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn show_cursor(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn get_cursor_position(&mut self) -> io::Result<Position> {
+                Ok(self.cursor)
+            }
+
+            fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+                self.cursor = position.into();
+                Ok(())
+            }
+
+            fn clear(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn append_lines(&mut self, _line_count: u16) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn scroll_region_up(
+                &mut self,
+                _region: std::ops::Range<u16>,
+                _scroll_by: u16,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn scroll_region_down(
+                &mut self,
+                _region: std::ops::Range<u16>,
+                _scroll_by: u16,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn size(&self) -> io::Result<Size> {
+                Ok(self.size)
+            }
+
+            fn window_size(&mut self) -> io::Result<WindowSize> {
+                Ok(WindowSize {
+                    columns_rows: self.size,
+                    pixels: self.size,
+                })
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn history_text(index: usize) -> String {
+            let fragment = format!(
+                "turn {index:03} CJK 混合 ASCII /tmp/codex/历史/{index}/file.rs \
+                 cargo test -p codex-tui history_{index} cafe\u{301} emoji 👩🏽‍💻 🚀 👍🏽 \
+                 ZWJ 👨🏿‍🚀 日本語 한글 中文 punctuation !? [] {{}} <> -- path-like-token-{index}\n"
+            );
+            let mut text = String::new();
+            while text.len() < 8 * 1024 {
+                text.push_str(&fragment);
+            }
+            text
+        }
+
+        fn build_composer(entries: &[String], drain_prewarm: bool) -> (ChatComposer, usize, usize) {
+            let (tx, mut rx) = unbounded_channel::<AppEvent>();
+            let mut composer = ChatComposer::new(
+                /*has_input_focus*/ true,
+                AppEventSender::new(tx),
+                /*enhanced_keys_supported*/ false,
+                "Ask Codex to do anything".to_string(),
+                /*disable_paste_burst*/ false,
+            );
+            composer.set_history_metadata(
+                ThreadId::new(),
+                /*log_id*/ 7,
+                /*entry_count*/ 0,
+            );
+            composer.observe_textarea_width(/*width*/ 80);
+
+            let total_bytes = entries.iter().map(String::len).sum::<usize>();
+            for entry in entries {
+                composer.record_local_history_entry(HistoryEntry::new(entry.clone()));
+            }
+
+            let mut prewarmed = 0usize;
+            if drain_prewarm {
+                while let Ok(event) = rx.try_recv() {
+                    if let AppEvent::PrewarmHistoryEntryRenderCache {
+                        key, width, text, ..
+                    } = event
+                    {
+                        let cache =
+                            crate::bottom_pane::prepare_textarea_wrap_cache(key, width, text);
+                        composer.remember_history_entry_render_cache(cache);
+                        prewarmed += 1;
+                    }
+                }
+            }
+            (composer, total_bytes, prewarmed)
+        }
+
+        fn recall_keys() -> impl Iterator<Item = KeyCode> {
+            [KeyCode::Up; 12]
+                .into_iter()
+                .chain([KeyCode::Down; 12])
+                .cycle()
+                .take(RECALL_SAMPLES)
+        }
+
+        fn drive_recall_minimal(
+            composer: &mut ChatComposer,
+            terminal: &mut Terminal<BenchmarkBackend>,
+        ) -> Vec<Duration> {
+            let mut samples = Vec::with_capacity(RECALL_SAMPLES);
+            let area = Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
+            );
+            for key in recall_keys() {
+                let total_start = Instant::now();
+                let _ = composer.desired_height(area.width);
+                let _ = composer.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
+                terminal
+                    .draw(|frame| composer.render(frame.area(), frame.buffer_mut()))
+                    .unwrap();
+                samples.push(total_start.elapsed());
+            }
+            samples
+        }
+
+        fn measure_minimal_overhead() -> Vec<Duration> {
+            let mut samples = Vec::with_capacity(RECALL_SAMPLES);
+            for _ in 0..RECALL_SAMPLES {
+                let total_start = Instant::now();
+                samples.push(total_start.elapsed());
+            }
+            samples
+        }
+
+        fn print_summary(label: &str, samples: &[Duration]) {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            let total = samples.iter().sum::<Duration>();
+            let p50 = sorted[sorted.len() / 2];
+            let p95 = sorted[sorted.len() * 95 / 100];
+            let max = sorted[sorted.len() - 1];
+            println!(
+                "RESULT {label} samples={} total_ms={:.3} p50_ms={:.4} p95_ms={:.4} max_ms={:.4}",
+                samples.len(),
+                total.as_secs_f64() * 1000.0,
+                p50.as_secs_f64() * 1000.0,
+                p95.as_secs_f64() * 1000.0,
+                max.as_secs_f64() * 1000.0
+            );
+        }
+
+        let entries = (0..100).map(history_text).collect::<Vec<_>>();
+        let (mut composer, total_bytes, prewarm_ready) =
+            build_composer(&entries, /*drain_prewarm*/ true);
+        println!("RESULT sample_bytes={total_bytes}");
+        println!("RESULT pr_prewarm_ready count={prewarm_ready}");
+        print_summary("minimal_overhead", &measure_minimal_overhead());
+        let mut terminal =
+            Terminal::with_options(BenchmarkBackend::new(/*width*/ 80, /*height*/ 48))
+                .expect("terminal");
+        terminal.set_viewport_area(Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
+        ));
+        let initial = drive_recall_minimal(&mut composer, &mut terminal);
+        let repeat = drive_recall_minimal(&mut composer, &mut terminal);
+        print_summary("pr_prewarmed_custom_minimal_initial", &initial);
+        print_summary("pr_prewarmed_custom_minimal_repeat", &repeat);
     }
 }

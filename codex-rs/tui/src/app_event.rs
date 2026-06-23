@@ -42,6 +42,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::PreparedWrapCache;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
+use crate::bottom_pane::TextAreaHistoryCacheKey;
 use crate::chatwidget::UserMessage;
 use crate::goal_files::GoalDraft;
 use codex_app_server_protocol::AskForApproval;
@@ -70,13 +71,6 @@ pub(crate) struct HistoryLookupResponse {
     pub(crate) offset: usize,
     pub(crate) log_id: u64,
     pub(crate) entry: Option<String>,
-    pub(crate) prewarmed_wrap_cache: Option<PreparedWrapCache>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HistoryLookupPrewarm {
-    pub(crate) width: u16,
-    pub(crate) at_mentions_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +140,12 @@ pub(crate) enum KeymapEditIntent {
     ReplaceOne { old_key: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryLookupPrewarm {
+    pub(crate) width: u16,
+    pub(crate) at_mentions_enabled: bool,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -170,6 +170,20 @@ pub(crate) enum AppEvent {
     ThreadHistoryEntryResponse {
         thread_id: ThreadId,
         event: HistoryLookupResponse,
+    },
+
+    /// Prepare a current-session history entry render cache off the input path.
+    PrewarmHistoryEntryRenderCache {
+        thread_id: ThreadId,
+        key: TextAreaHistoryCacheKey,
+        width: u16,
+        text: String,
+    },
+
+    /// Deliver a prepared current-session history entry render cache to its owning thread.
+    ThreadHistoryEntryRenderCacheReady {
+        thread_id: ThreadId,
+        cache: PreparedWrapCache,
     },
 
     /// Persist a submitted prompt in the cross-session message history.

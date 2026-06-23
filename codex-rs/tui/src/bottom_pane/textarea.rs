@@ -49,6 +49,12 @@ const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 const RECENT_WRAP_CACHE_LIMIT: usize = 32;
 const RECENT_WRAP_CACHE_MAX_TEXT_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TextAreaHistoryCacheKey {
+    Local(u64),
+    Persistent { log_id: u64, offset: usize },
+}
+
 fn is_word_separator(ch: char) -> bool {
     WORD_SEPARATORS.contains(ch)
 }
@@ -86,10 +92,11 @@ fn wrap_textarea_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
     )
 }
 
-fn rendered_line_for_range(text: &str, range: &Range<usize>) -> RenderedLine {
+fn rendered_line_for_range(text: &str, range: &Range<usize>, line_width: u16) -> RenderedLine {
     let line_range = range.start..range.end - 1;
-    let mut col = 0;
+    let mut col: u16 = 0;
     let mut cells = Vec::new();
+    let mut default_cells = vec![Cell::default(); usize::from(line_width)].into_boxed_slice();
     for (offset, symbol) in text[line_range.clone()].grapheme_indices(true) {
         if symbol.contains(|ch: char| ch.is_control()) {
             continue;
@@ -100,15 +107,24 @@ fn rendered_line_for_range(text: &str, range: &Range<usize>) -> RenderedLine {
         }
         let mut default_cell = Cell::default();
         default_cell.set_symbol(symbol);
+        let next_col = col.saturating_add(width);
+        if next_col <= line_width {
+            default_cells[usize::from(col)] = default_cell;
+            for col in col + 1..next_col {
+                default_cells[usize::from(col)].reset();
+            }
+        }
         cells.push(RenderedCell {
             col,
             range: line_range.start + offset..line_range.start + offset + symbol.len(),
             width,
-            default_cell,
         });
-        col = col.saturating_add(width);
+        col = next_col;
     }
-    cells
+    RenderedLine {
+        cells,
+        default_cells,
+    }
 }
 
 fn lazy_rendered_lines_for_ranges(lines: &[Range<usize>]) -> RefCell<Vec<Option<RenderedLine>>> {
@@ -118,11 +134,12 @@ fn lazy_rendered_lines_for_ranges(lines: &[Range<usize>]) -> RefCell<Vec<Option<
 fn prepared_rendered_lines_for_ranges(
     text: &str,
     lines: &[Range<usize>],
+    width: u16,
 ) -> RefCell<Vec<Option<RenderedLine>>> {
     RefCell::new(
         lines
             .iter()
-            .map(|range| Some(rendered_line_for_range(text, range)))
+            .map(|range| Some(rendered_line_for_range(text, range, width)))
             .collect(),
     )
 }
@@ -152,6 +169,7 @@ pub(crate) struct TextElementSnapshot {
 pub(crate) struct TextArea {
     text: String,
     generation: u64,
+    history_cache_key: Option<TextAreaHistoryCacheKey>,
     cursor_pos: usize,
     wrap_cache: RefCell<Option<WrapCache>>,
     recent_wrap_caches: RefCell<VecDeque<WrapCache>>,
@@ -171,6 +189,7 @@ pub(crate) struct TextArea {
 
 #[derive(Debug, Clone)]
 struct WrapCache {
+    key: Option<TextAreaHistoryCacheKey>,
     width: u16,
     generation: u64,
     text: String,
@@ -185,16 +204,23 @@ impl PreparedWrapCache {
     pub(crate) fn width(&self) -> u16 {
         self.0.width
     }
+
+    pub(crate) fn key(&self) -> Option<TextAreaHistoryCacheKey> {
+        self.0.key
+    }
 }
 
-type RenderedLine = Vec<RenderedCell>;
+#[derive(Debug, Clone)]
+struct RenderedLine {
+    cells: Vec<RenderedCell>,
+    default_cells: Box<[Cell]>,
+}
 
 #[derive(Debug, Clone)]
 struct RenderedCell {
     col: u16,
     range: Range<usize>,
     width: u16,
-    default_cell: Cell,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -223,27 +249,45 @@ impl TextArea {
         if cache.text.is_empty() || cache.text.len() > RECENT_WRAP_CACHE_MAX_TEXT_BYTES {
             return;
         }
+        let Some(key) = cache.key else {
+            return;
+        };
 
         let mut recent = self.recent_wrap_caches.borrow_mut();
-        if recent
+        if let Some(index) = recent
             .iter()
-            .any(|cached| cached.width == cache.width && cached.text == cache.text)
+            .position(|cached| cached.width == cache.width && cached.key == Some(key))
         {
-            return;
+            recent.remove(index);
         }
         recent.push_front(cache);
         recent.truncate(RECENT_WRAP_CACHE_LIMIT);
     }
 
-    fn take_recent_wrap_cache(&self, width: u16, text: &str) -> Option<WrapCache> {
+    fn take_recent_wrap_cache(
+        &self,
+        width: u16,
+        key: Option<TextAreaHistoryCacheKey>,
+    ) -> Option<WrapCache> {
+        let key = key?;
         let mut recent = self.recent_wrap_caches.borrow_mut();
         let index = recent
             .iter()
-            .position(|cached| cached.width == width && cached.text == text)?;
+            .position(|cached| cached.width == width && cached.key == Some(key))?;
         recent.remove(index)
     }
 
-    pub(crate) fn warm_recent_wrap_cache(&self, width: u16, text: &str) {
+    pub(crate) fn cacheable_text(text: &str) -> bool {
+        !text.is_empty() && text.len() <= RECENT_WRAP_CACHE_MAX_TEXT_BYTES
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warm_recent_wrap_cache(
+        &self,
+        key: TextAreaHistoryCacheKey,
+        width: u16,
+        text: &str,
+    ) {
         if text.is_empty() || text.len() > RECENT_WRAP_CACHE_MAX_TEXT_BYTES {
             return;
         }
@@ -251,13 +295,13 @@ impl TextArea {
             .recent_wrap_caches
             .borrow()
             .iter()
-            .any(|cached| cached.width == width && cached.text == text)
+            .any(|cached| cached.width == width && cached.key == Some(key))
         {
             return;
         }
         if let Some(cache) = self.wrap_cache.borrow().as_ref()
             && cache.width == width
-            && cache.text == text
+            && cache.key == Some(key)
         {
             self.remember_wrap_cache(cache.clone());
             return;
@@ -265,6 +309,7 @@ impl TextArea {
 
         let lines = wrap_textarea_ranges(text, width);
         self.remember_wrap_cache(WrapCache {
+            key: Some(key),
             width,
             generation: 0,
             text: text.to_string(),
@@ -273,10 +318,15 @@ impl TextArea {
         });
     }
 
-    pub(crate) fn prepare_wrap_cache(width: u16, text: String) -> PreparedWrapCache {
+    pub(crate) fn prepare_wrap_cache(
+        key: TextAreaHistoryCacheKey,
+        width: u16,
+        text: String,
+    ) -> PreparedWrapCache {
         let lines = wrap_textarea_ranges(&text, width);
-        let rendered_lines = prepared_rendered_lines_for_ranges(&text, &lines);
+        let rendered_lines = prepared_rendered_lines_for_ranges(&text, &lines, width);
         PreparedWrapCache(WrapCache {
+            key: Some(key),
             width,
             generation: 0,
             text,
@@ -286,7 +336,22 @@ impl TextArea {
     }
 
     pub(crate) fn remember_prepared_wrap_cache(&self, cache: PreparedWrapCache) {
-        self.remember_wrap_cache(cache.0);
+        let mut cache = cache.0;
+        let Some(key) = cache.key else {
+            return;
+        };
+        if self.history_cache_key == Some(key)
+            && self
+                .wrap_cache
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| current.width == cache.width && current.key == Some(key))
+        {
+            cache.generation = self.generation;
+            self.wrap_cache.replace(Some(cache));
+        } else {
+            self.remember_wrap_cache(cache);
+        }
     }
 
     pub fn new() -> Self {
@@ -294,6 +359,7 @@ impl TextArea {
         Self {
             text: String::new(),
             generation: 0,
+            history_cache_key: None,
             cursor_pos: 0,
             wrap_cache: RefCell::new(None),
             recent_wrap_caches: RefCell::new(VecDeque::new()),
@@ -332,7 +398,9 @@ impl TextArea {
     /// as submit or slash-command dispatch clear the draft through this method and still want
     /// `Ctrl+Y` to recover the user's most recent kill.
     pub fn set_text_clearing_elements(&mut self, text: &str) {
-        self.set_text_inner(text, /*elements*/ None);
+        self.set_text_inner(
+            text, /*elements*/ None, /*history_cache_key*/ None,
+        );
     }
 
     /// Replace the visible textarea text and rebuild the provided text elements.
@@ -341,14 +409,34 @@ impl TextArea {
     /// visible buffer. The kill buffer survives so callers restoring drafts or external edits do
     /// not silently discard a pending yank target.
     pub fn set_text_with_elements(&mut self, text: &str, elements: &[UserTextElement]) {
-        self.set_text_inner(text, Some(elements));
+        self.set_text_inner(text, Some(elements), /*history_cache_key*/ None);
     }
 
-    fn set_text_inner(&mut self, text: &str, elements: Option<&[UserTextElement]>) {
+    pub(crate) fn set_text_with_history_cache_key(
+        &mut self,
+        text: &str,
+        elements: &[UserTextElement],
+        history_cache_key: TextAreaHistoryCacheKey,
+    ) {
+        self.set_text_inner(text, Some(elements), Some(history_cache_key));
+    }
+
+    pub(crate) fn history_cache_key(&self) -> Option<TextAreaHistoryCacheKey> {
+        self.history_cache_key
+    }
+
+    fn set_text_inner(
+        &mut self,
+        text: &str,
+        elements: Option<&[UserTextElement]>,
+        history_cache_key: Option<TextAreaHistoryCacheKey>,
+    ) {
         self.stash_wrap_cache();
         // Stage 1: replace the raw text and keep the cursor in a safe byte range.
-        self.text = text.to_string();
+        self.text.clear();
+        self.text.push_str(text);
         self.generation = self.generation.wrapping_add(1);
+        self.history_cache_key = history_cache_key;
         self.cursor_pos = self.cursor_pos.clamp(0, self.text.len());
         // Stage 2: rebuild element ranges from scratch against the new text.
         self.elements.clear();
@@ -373,6 +461,7 @@ impl TextArea {
         // The kill buffer is editing history rather than visible-buffer state, so full-buffer
         // replacements intentionally leave it alone.
         self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
+        self.wrap_cache.replace(None);
         self.preferred_col = None;
     }
 
@@ -503,6 +592,7 @@ impl TextArea {
         let pos = self.clamp_pos_for_insertion(pos);
         self.text.insert_str(pos, text);
         self.generation = self.generation.wrapping_add(1);
+        self.history_cache_key = None;
         self.wrap_cache.replace(None);
         if pos <= self.cursor_pos {
             self.cursor_pos += text.len();
@@ -529,6 +619,7 @@ impl TextArea {
 
         self.text.replace_range(range, text);
         self.generation = self.generation.wrapping_add(1);
+        self.history_cache_key = None;
         self.wrap_cache.replace(None);
         self.preferred_col = None;
         self.update_elements_after_replace(start, end, inserted_len);
@@ -1572,6 +1663,7 @@ impl TextArea {
         let diff = inserted_len as isize - removed_len as isize;
 
         self.text.replace_range(range, new);
+        self.history_cache_key = None;
         self.wrap_cache.replace(None);
         self.preferred_col = None;
 
@@ -1984,12 +2076,14 @@ impl TextArea {
                 if let Some(old_cache) = cache.take() {
                     self.remember_wrap_cache(old_cache);
                 }
-                if let Some(mut reused) = self.take_recent_wrap_cache(width, &self.text) {
+                if let Some(mut reused) = self.take_recent_wrap_cache(width, self.history_cache_key)
+                {
                     reused.generation = self.generation;
                     *cache = Some(reused);
                 } else {
                     let lines = wrap_textarea_ranges(&self.text, width);
                     *cache = Some(WrapCache {
+                        key: self.history_cache_key,
                         width,
                         generation: self.generation,
                         text: self.text.clone(),
@@ -2171,15 +2265,16 @@ impl TextArea {
             return;
         }
 
+        let mut rendered_lines = cache.rendered_lines.borrow_mut();
         for (row, idx) in range.enumerate() {
             let y = area.y + row as u16;
             buf.set_style(Rect::new(area.x, y, area.width, 1), base_style);
 
-            let mut rendered_lines = cache.rendered_lines.borrow_mut();
-            let rendered_line = rendered_lines[idx]
-                .get_or_insert_with(|| rendered_line_for_range(&cache.text, &cache.lines[idx]));
+            let rendered_line = rendered_lines[idx].get_or_insert_with(|| {
+                rendered_line_for_range(&cache.text, &cache.lines[idx], cache.width)
+            });
 
-            for cell in rendered_line.iter() {
+            for cell in rendered_line.cells.iter() {
                 let mut x = area.x + cell.col;
                 let next_x = x.saturating_add(cell.width);
                 if next_x > area.right() {
@@ -2203,24 +2298,17 @@ impl TextArea {
         cache: &WrapCache,
         range: std::ops::Range<usize>,
     ) {
+        let width = usize::from(area.width);
+        let mut rendered_lines = cache.rendered_lines.borrow_mut();
         for (row, idx) in range.enumerate() {
             let y = area.y + row as u16;
             let row_start = buf.index_of(area.x, y);
 
-            let mut rendered_lines = cache.rendered_lines.borrow_mut();
-            let rendered_line = rendered_lines[idx]
-                .get_or_insert_with(|| rendered_line_for_range(&cache.text, &cache.lines[idx]));
-
-            for cell in rendered_line.iter() {
-                let next_col = cell.col.saturating_add(cell.width);
-                if next_col > area.width {
-                    break;
-                }
-                buf.content[row_start + usize::from(cell.col)] = cell.default_cell.clone();
-                for col in cell.col + 1..next_col {
-                    buf.content[row_start + usize::from(col)].reset();
-                }
-            }
+            let rendered_line = rendered_lines[idx].get_or_insert_with(|| {
+                rendered_line_for_range(&cache.text, &cache.lines[idx], cache.width)
+            });
+            let row_end = row_start + width;
+            buf.content[row_start..row_end].clone_from_slice(&rendered_line.default_cells[..width]);
         }
     }
 
@@ -3653,13 +3741,16 @@ mod tests {
     fn wrap_cache_reused_after_whole_buffer_restore() {
         let first = "你好 世界 👍🏽 👩🏾‍💻 テスト 한글 ".repeat(160);
         let second = "缓存 替换 👋🏻 👨🏿‍🚀 emoji 中文 ".repeat(160);
-        let mut t = ta_with(&first);
+        let mut t = TextArea::new();
+        let first_key = TextAreaHistoryCacheKey::Local(1);
+        let second_key = TextAreaHistoryCacheKey::Local(2);
+        t.set_text_with_history_cache_key(&first, &[], first_key);
         let first_height = t.desired_height(/*width*/ 12);
         let first_lines = t.wrap_cache.borrow().as_ref().unwrap().lines.clone();
 
-        t.set_text_clearing_elements(&second);
+        t.set_text_with_history_cache_key(&second, &[], second_key);
         let _ = t.desired_height(/*width*/ 12);
-        t.set_text_clearing_elements(&first);
+        t.set_text_with_history_cache_key(&first, &[], first_key);
 
         let recent_before = t.recent_wrap_caches.borrow().len();
         assert_eq!(t.desired_height(/*width*/ 12), first_height);
@@ -3673,11 +3764,12 @@ mod tests {
     #[test]
     fn warmed_wrap_cache_reused_for_whole_buffer_restore() {
         let text = "预热 缓存 👍🏻 👩🏽‍🔬 テスト 한글 ".repeat(160);
+        let key = TextAreaHistoryCacheKey::Local(1);
         let mut t = TextArea::new();
-        t.warm_recent_wrap_cache(/*width*/ 12, &text);
+        t.warm_recent_wrap_cache(key, /*width*/ 12, &text);
         assert_eq!(t.recent_wrap_caches.borrow().len(), 1);
 
-        t.set_text_clearing_elements(&text);
+        t.set_text_with_history_cache_key(&text, &[], key);
 
         let expected_lines = wrap_textarea_ranges(&text, /*width*/ 12);
         assert_eq!(t.desired_height(/*width*/ 12), expected_lines.len() as u16);
@@ -3691,8 +3783,9 @@ mod tests {
     #[test]
     fn warmed_wrap_cache_renders_lines_lazily() {
         let text = "预热 cache 👍🏻 👩🏽‍🔬 ASCII path /tmp/demo テスト 한글 ".repeat(160);
+        let key = TextAreaHistoryCacheKey::Local(1);
         let mut t = TextArea::new();
-        t.warm_recent_wrap_cache(/*width*/ 12, &text);
+        t.warm_recent_wrap_cache(key, /*width*/ 12, &text);
         assert!(
             wrap_textarea_ranges(&text, /*width*/ 12).len() > 3,
             "test input should wrap beyond the visible area",
@@ -3705,7 +3798,7 @@ mod tests {
                 .all(Option::is_none)
         );
 
-        t.set_text_clearing_elements(&text);
+        t.set_text_with_history_cache_key(&text, &[], key);
         let area = Rect::new(
             /*x*/ 0, /*y*/ 0, /*width*/ 12, /*height*/ 3,
         );

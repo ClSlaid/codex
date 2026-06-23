@@ -360,6 +360,15 @@ impl App {
                 self.lookup_message_history_entry(thread_id, offset, log_id, prewarm)
                     .await?;
             }
+            AppEvent::PrewarmHistoryEntryRenderCache {
+                thread_id,
+                key,
+                width,
+                text,
+            } => {
+                self.prewarm_history_entry_render_cache(thread_id, key, width, text)
+                    .await?;
+            }
             AppEvent::ApproveRecentAutoReviewDenial { thread_id, id } => {
                 self.chat_widget
                     .approve_recent_auto_review_denial(thread_id, id);
@@ -370,6 +379,12 @@ impl App {
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;
+            }
+            AppEvent::ThreadHistoryEntryRenderCacheReady { thread_id, cache } => {
+                if self.current_displayed_thread_id() == Some(thread_id) {
+                    self.chat_widget.remember_history_entry_render_cache(cache);
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane

@@ -47,6 +47,7 @@ use crate::app_event::HistoryLookupResponse;
 use crate::app_server_approval_conversions::file_update_changes_to_display;
 use crate::approval_events::ApplyPatchApprovalRequestEvent;
 use crate::approval_events::ExecApprovalRequestEvent;
+use crate::bottom_pane::PreparedWrapCache;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::StatusSurfacePreviewData;
@@ -1176,10 +1177,13 @@ impl ChatWidget {
             offset,
             log_id,
             entry,
-            prewarmed_wrap_cache,
         } = event;
         self.bottom_pane
-            .on_history_entry_response(log_id, offset, entry, prewarmed_wrap_cache);
+            .on_history_entry_response(log_id, offset, entry);
+    }
+
+    pub(crate) fn remember_history_entry_render_cache(&mut self, cache: PreparedWrapCache) {
+        self.bottom_pane.remember_history_entry_render_cache(cache);
     }
 
     pub(crate) fn pre_draw_tick(&mut self) {
@@ -1326,7 +1330,8 @@ impl ChatWidget {
             });
             self.bottom_pane
                 .record_replayed_user_message_history(HistoryEntry {
-                    text: display.message.clone(),
+                    cache_key: None,
+                    text: display.message.clone().into(),
                     text_elements: display.text_elements.clone(),
                     local_image_paths: display.local_images.clone(),
                     remote_image_urls: display.remote_image_urls.clone(),

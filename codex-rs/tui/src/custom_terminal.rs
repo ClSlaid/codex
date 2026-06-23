@@ -55,6 +55,13 @@ use unicode_width::UnicodeWidthStr;
 /// This function strips them first so that only visible characters contribute
 /// to the width.
 fn display_width(s: &str) -> usize {
+    if s == " " {
+        return 1;
+    }
+    if s.len() == 1 && s.as_bytes()[0].is_ascii_graphic() {
+        return 1;
+    }
+
     // Fast path: no escape sequences present.
     if !s.contains('\x1B') {
         return s.width();
@@ -577,13 +584,21 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
 
-    let mut updates = vec![];
-    let mut last_nonblank_columns = vec![0; a.area.height as usize];
+    let width = usize::from(a.area.width);
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut updates = Vec::new();
     for y in 0..a.area.height {
         let row_start = y as usize * a.area.width as usize;
-        let row_end = row_start + a.area.width as usize;
-        let row = &next_buffer[row_start..row_end];
-        let bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
+        let row_end = row_start + width;
+        let previous_row = &previous_buffer[row_start..row_end];
+        let next_row = &next_buffer[row_start..row_end];
+        if previous_row == next_row {
+            continue;
+        }
+        let bg = next_row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
 
         // Scan the row to find the rightmost column that still matters: any non-space glyph,
         // any cell whose bg differs from the row’s trailing bg, or any cell with modifiers.
@@ -591,49 +606,47 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
         // After that point the rest of the row can be cleared with a single ClearToEnd, a perf win
         // versus emitting multiple space Put commands.
         let mut last_nonblank_column = 0usize;
+        // Cells invalidated by drawing/replacing preceding multi-width characters.
+        let mut invalidated: usize = 0;
+        // Cells from the current buffer to skip due to preceding multi-width characters taking
+        // their place (the skipped cells should be blank anyway), or due to per-cell-skipping.
+        let mut to_skip: usize = 0;
+        let mut row_puts = Vec::new();
         let mut column = 0usize;
-        while column < row.len() {
-            let cell = &row[column];
+        while column < next_row.len() {
+            let cell = &next_row[column];
             let width = display_width(cell.symbol());
             if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
                 last_nonblank_column = column + (width.saturating_sub(1));
             }
+
+            let previous = &previous_row[column];
+            if !cell.skip && (cell != previous || invalidated > 0) && to_skip == 0 {
+                let (x, y) = a.pos_of(row_start + column);
+                row_puts.push(DrawCommand::Put {
+                    x,
+                    y,
+                    cell: cell.clone(),
+                });
+            }
+
+            to_skip = width.saturating_sub(1);
+
+            let affected_width = std::cmp::max(width, display_width(previous.symbol()));
+            invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
             column += width.max(1); // treat zero-width symbols as width 1
         }
 
-        if last_nonblank_column + 1 < row.len() {
+        if last_nonblank_column + 1 < next_row.len()
+            && previous_row[last_nonblank_column + 1..] != next_row[last_nonblank_column + 1..]
+        {
             let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
             updates.push(DrawCommand::ClearToEnd { x, y, bg });
         }
 
-        last_nonblank_columns[y as usize] = last_nonblank_column as u16;
-    }
-
-    // Cells invalidated by drawing/replacing preceding multi-width characters:
-    let mut invalidated: usize = 0;
-    // Cells from the current buffer to skip due to preceding multi-width characters taking
-    // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
-    let mut to_skip: usize = 0;
-    for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !current.skip && (current != previous || invalidated > 0) && to_skip == 0 {
-            let (x, y) = a.pos_of(i);
-            let row = i / a.area.width as usize;
-            if x <= last_nonblank_columns[row] {
-                updates.push(DrawCommand::Put {
-                    x,
-                    y,
-                    cell: next_buffer[i].clone(),
-                });
-            }
-        }
-
-        to_skip = display_width(current.symbol()).saturating_sub(1);
-
-        let affected_width = std::cmp::max(
-            display_width(current.symbol()),
-            display_width(previous.symbol()),
-        );
-        invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
+        updates.extend(row_puts.into_iter().filter(|command| {
+            matches!(command, DrawCommand::Put { x, .. } if usize::from(x.saturating_sub(a.area.x)) <= last_nonblank_column)
+        }));
     }
     updates
 }
@@ -870,6 +883,44 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn diff_buffers_skips_unchanged_blank_rows() {
+        let area = Rect::new(0, 0, 3, 2);
+        let previous = Buffer::empty(area);
+        let next = Buffer::empty(area);
+
+        let commands = diff_buffers(&previous, &next);
+
+        assert!(
+            commands.is_empty(),
+            "expected no commands for identical buffers; commands: {commands:?}",
+        );
+    }
+
+    #[test]
+    fn diff_buffers_clear_to_end_only_when_trailing_cells_changed() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+
+        previous.set_string(0, 0, "abc", Style::default());
+        next.set_string(0, 0, "a", Style::default());
+
+        let commands = diff_buffers(&previous, &next);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 1, y: 0, .. })),
+            "expected clear-to-end after shortened content; commands: {commands:?}",
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, DrawCommand::Put { x, y: 0, .. } if *x > 0)),
+            "expected trailing cells to be cleared instead of put individually; commands: {commands:?}",
+        );
     }
 
     #[test]

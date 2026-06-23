@@ -150,9 +150,19 @@ pub(crate) use feedback_view::FeedbackNoteView;
 pub(crate) use hooks_browser_view::HooksBrowserView;
 pub(crate) use selection_tabs::SelectionTab;
 pub(crate) use textarea::PreparedWrapCache;
+pub(crate) use textarea::TextAreaHistoryCacheKey;
 
-pub(crate) fn prepare_textarea_wrap_cache(width: u16, text: String) -> PreparedWrapCache {
-    textarea::TextArea::prepare_wrap_cache(width, text)
+pub(crate) fn prepare_textarea_wrap_cache(
+    key: TextAreaHistoryCacheKey,
+    width: u16,
+    text: String,
+) -> PreparedWrapCache {
+    let text = if let Some(stripped) = text.strip_prefix('!') {
+        stripped.to_string()
+    } else {
+        text
+    };
+    textarea::TextArea::prepare_wrap_cache(key, width, text)
 }
 
 /// How long the "press again to quit" hint stays visible.
@@ -1621,16 +1631,22 @@ impl BottomPane {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
-        prewarmed_wrap_cache: Option<textarea::PreparedWrapCache>,
     ) {
-        let updated =
-            self.composer
-                .on_history_entry_response(log_id, offset, entry, prewarmed_wrap_cache);
+        let updated = self
+            .composer
+            .on_history_entry_response(log_id, offset, entry);
 
         if updated {
             self.composer.sync_popups();
             self.request_redraw();
         }
+    }
+
+    pub(crate) fn remember_history_entry_render_cache(
+        &mut self,
+        cache: textarea::PreparedWrapCache,
+    ) {
+        self.composer.remember_history_entry_render_cache(cache);
     }
 
     pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
