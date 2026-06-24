@@ -39,6 +39,7 @@ use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
+use crossterm::terminal::ClearType as CrosstermClearType;
 use derive_more::IsVariant;
 use ratatui::backend::Backend;
 use ratatui::backend::ClearType;
@@ -895,6 +896,7 @@ fn encode_dense_rows(
     let mut current_bg = Color::Reset;
     let mut modifier = Modifier::empty();
     let mut next_pos: Option<Position> = None;
+    let clear_to_bottom_bg = dense_clear_to_bottom_bg(buffer, rows.clone(), width);
     let mut run = DenseRun {
         bytes: Vec::with_capacity(width.saturating_mul(4)),
         end_col: 0,
@@ -905,6 +907,23 @@ fn encode_dense_rows(
         modifier: Modifier::empty(),
     };
 
+    if let Some(bg) = clear_to_bottom_bg {
+        draw_dense_clear(
+            writer,
+            Position {
+                x: buffer.area.x,
+                y: rows.start,
+            },
+            bg,
+            CrosstermClearType::FromCursorDown,
+            &mut fg,
+            &mut current_bg,
+            &mut modifier,
+            &mut next_pos,
+        )?;
+        stats.commands += 1;
+    }
+
     for absolute_y in rows {
         let y = absolute_y - buffer.area.y;
         let row_start = y as usize * width;
@@ -912,19 +931,22 @@ fn encode_dense_rows(
         let row = &buffer.content[row_start..row_end];
         let row_bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
         let Some(last_nonblank_column) = last_nonblank_column(row, row_bg) else {
-            draw_dense_clear_to_end(
-                writer,
-                Position {
-                    x: buffer.area.x,
-                    y: buffer.area.y + y,
-                },
-                row_bg,
-                &mut fg,
-                &mut current_bg,
-                &mut modifier,
-                &mut next_pos,
-            )?;
-            stats.commands += 1;
+            if clear_to_bottom_bg.is_none() {
+                draw_dense_clear(
+                    writer,
+                    Position {
+                        x: buffer.area.x,
+                        y: buffer.area.y + y,
+                    },
+                    row_bg,
+                    CrosstermClearType::UntilNewLine,
+                    &mut fg,
+                    &mut current_bg,
+                    &mut modifier,
+                    &mut next_pos,
+                )?;
+                stats.commands += 1;
+            }
             continue;
         };
 
@@ -990,14 +1012,15 @@ fn encode_dense_rows(
             run.bytes.clear();
         }
 
-        if last_nonblank_column + 1 < row.len() {
-            draw_dense_clear_to_end(
+        if clear_to_bottom_bg.is_none() && last_nonblank_column + 1 < row.len() {
+            draw_dense_clear(
                 writer,
                 Position {
                     x: buffer.area.x + (last_nonblank_column + 1) as u16,
                     y: buffer.area.y + y,
                 },
                 row_bg,
+                CrosstermClearType::UntilNewLine,
                 &mut fg,
                 &mut current_bg,
                 &mut modifier,
@@ -1015,6 +1038,30 @@ fn encode_dense_rows(
     )?;
 
     Ok(stats)
+}
+
+fn dense_clear_to_bottom_bg(buffer: &Buffer, rows: Range<u16>, width: usize) -> Option<Color> {
+    // Clearing down is only safe when the repaint range reaches the viewport bottom, and only
+    // when every row has the same trailing background because the terminal clear uses one bg.
+    if rows.end != buffer.area.bottom() || rows.end.saturating_sub(rows.start) <= 1 {
+        return None;
+    }
+
+    let mut bg = None;
+    for absolute_y in rows {
+        let y = absolute_y - buffer.area.y;
+        let row_start = y as usize * width;
+        let row_end = row_start + width;
+        let row_bg = buffer.content[row_start..row_end]
+            .last()
+            .map(|cell| cell.bg)
+            .unwrap_or(Color::Reset);
+        if bg.is_some_and(|bg| bg != row_bg) {
+            return None;
+        }
+        bg = Some(row_bg);
+    }
+    bg
 }
 
 fn draw_dense_run(
@@ -1051,10 +1098,11 @@ fn draw_dense_run(
     Ok(())
 }
 
-fn draw_dense_clear_to_end(
+fn draw_dense_clear(
     writer: &mut impl Write,
     position: Position,
     bg: Color,
+    clear_type: CrosstermClearType,
     fg: &mut Color,
     current_bg: &mut Color,
     modifier: &mut Modifier,
@@ -1073,7 +1121,7 @@ fn draw_dense_clear_to_end(
         queue!(writer, SetBackgroundColor(bg.into()))?;
         *current_bg = bg;
     }
-    queue!(writer, Clear(crossterm::terminal::ClearType::UntilNewLine))?;
+    queue!(writer, Clear(clear_type))?;
     *next_pos = Some(position);
     Ok(())
 }
@@ -1451,6 +1499,39 @@ mod tests {
             "expected one text run plus trailing clear; output: {:?}",
             String::from_utf8_lossy(&output)
         );
+    }
+
+    #[test]
+    fn dense_rows_clear_bottom_range_once() {
+        let area = Rect::new(0, 0, 8, 3);
+        let mut next = Buffer::empty(area);
+        let mut output = Vec::new();
+
+        next.set_string(0, 0, "first", Style::default());
+        next.set_string(0, 1, "二行", Style::default());
+
+        let stats = draw_dense_rows(&mut output, &next, 0..3).expect("dense rows");
+
+        let mut clear_down = Vec::new();
+        queue!(clear_down, Clear(CrosstermClearType::FromCursorDown)).expect("queue clear down");
+        assert!(
+            output
+                .windows(clear_down.len())
+                .any(|bytes| bytes == clear_down),
+            "expected dense render to clear the bottom range once; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        let mut clear_to_end = Vec::new();
+        queue!(clear_to_end, Clear(CrosstermClearType::UntilNewLine)).expect("queue clear to end");
+        assert!(
+            !output
+                .windows(clear_to_end.len())
+                .any(|bytes| bytes == clear_to_end),
+            "expected dense render to skip per-row tail clears; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(3, stats.commands);
     }
 
     #[test]
