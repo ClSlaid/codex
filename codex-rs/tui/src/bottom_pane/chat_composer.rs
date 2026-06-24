@@ -11655,9 +11655,21 @@ mod tests {
                 .take(RECALL_SAMPLES)
         }
 
-        fn drive_recall_minimal(
+        fn benchmark_terminal() -> Terminal<BenchmarkBackend> {
+            let mut terminal = Terminal::with_options(BenchmarkBackend::new(
+                /*width*/ 80, /*height*/ 48,
+            ))
+            .expect("terminal");
+            terminal.set_viewport_area(Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
+            ));
+            terminal
+        }
+
+        fn drive_recall_keys(
             composer: &mut ChatComposer,
             terminal: &mut Terminal<BenchmarkBackend>,
+            keys: impl IntoIterator<Item = KeyCode>,
         ) -> Vec<RecallSample> {
             let mut samples = Vec::with_capacity(RECALL_SAMPLES);
             let area = Rect::new(
@@ -11665,7 +11677,7 @@ mod tests {
             );
             let initial_repaint_height = composer.desired_height(area.width).min(area.height);
             let mut previous_repaint_top = area.bottom().saturating_sub(initial_repaint_height);
-            for key in recall_keys() {
+            for key in keys {
                 let bytes_before = terminal.backend().bytes_written;
                 let total_start = Instant::now();
                 let started = Instant::now();
@@ -11714,6 +11726,13 @@ mod tests {
                 });
             }
             samples
+        }
+
+        fn drive_recall_minimal(
+            composer: &mut ChatComposer,
+            terminal: &mut Terminal<BenchmarkBackend>,
+        ) -> Vec<RecallSample> {
+            drive_recall_keys(composer, terminal, recall_keys())
         }
 
         fn measure_nested_probe_overhead(measurements: usize) -> Vec<Duration> {
@@ -11898,12 +11917,6 @@ mod tests {
         }
 
         let entries = (0..100).map(history_text).collect::<Vec<_>>();
-        let (mut composer, total_bytes, prewarm_ready) =
-            build_composer(&entries, /*drain_prewarm*/ true);
-        emit_result(format_args!("RESULT sample_bytes={total_bytes}"));
-        emit_result(format_args!(
-            "RESULT pr_prewarm_ready count={prewarm_ready}"
-        ));
         let phase_probe_overhead_samples = measure_nested_probe_overhead(0);
         let phase_probe_overhead = median(&phase_probe_overhead_samples);
         print_duration_summary(
@@ -11927,12 +11940,46 @@ mod tests {
             &recall_probe_overhead_samples,
             Duration::ZERO,
         );
-        let mut terminal =
-            Terminal::with_options(BenchmarkBackend::new(/*width*/ 80, /*height*/ 48))
-                .expect("terminal");
-        terminal.set_viewport_area(Rect::new(
-            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
+
+        let (mut composer, total_bytes, prewarm_ready) =
+            build_composer(&entries, /*drain_prewarm*/ false);
+        emit_result(format_args!("RESULT sample_bytes={total_bytes}"));
+        emit_result(format_args!(
+            "RESULT without_prewarm_ready count={prewarm_ready}"
         ));
+        let mut terminal = benchmark_terminal();
+        let up_12_first_without_prewarm =
+            drive_recall_keys(&mut composer, &mut terminal, [KeyCode::Up; 12]);
+        print_recall_summary(
+            "up_12_first_without_prewarm",
+            &up_12_first_without_prewarm,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
+        );
+
+        let (mut composer, _, prewarm_ready) =
+            build_composer(&entries, /*drain_prewarm*/ true);
+        emit_result(format_args!(
+            "RESULT with_prewarm_ready count={prewarm_ready}"
+        ));
+        let mut terminal = benchmark_terminal();
+        let up_12_first_with_prewarm =
+            drive_recall_keys(&mut composer, &mut terminal, [KeyCode::Up; 12]);
+        print_recall_summary(
+            "up_12_first_with_prewarm",
+            &up_12_first_with_prewarm,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
+        );
+
+        let (mut composer, _, prewarm_ready) =
+            build_composer(&entries, /*drain_prewarm*/ true);
+        emit_result(format_args!(
+            "RESULT pr_prewarm_ready count={prewarm_ready}"
+        ));
+        let mut terminal = benchmark_terminal();
         let initial = drive_recall_minimal(&mut composer, &mut terminal);
         let repeat = drive_recall_minimal(&mut composer, &mut terminal);
         print_recall_summary(
