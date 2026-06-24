@@ -2232,7 +2232,9 @@ impl TextArea {
                 if x.saturating_add(cell.width) > area.right() {
                     break;
                 }
-                buf[(x, y)].set_symbol(&cache.text[cell.range.clone()]);
+                // Reuse the cached cell so dense repaint does not rebuild the symbol's
+                // CompactString from the source text on every frame.
+                buf[(x, y)].clone_from(&rendered_line.default_cells[usize::from(cell.col)]);
             }
         }
     }
