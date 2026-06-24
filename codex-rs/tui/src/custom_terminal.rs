@@ -930,7 +930,7 @@ fn encode_dense_rows(
         let row_end = row_start + width;
         let row = &buffer.content[row_start..row_end];
         let row_bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
-        let Some(last_nonblank_column) = last_nonblank_column(row, row_bg) else {
+        let Some(last_nonblank_column) = last_nonblank_cell_start(row, row_bg) else {
             if clear_to_bottom_bg.is_none() {
                 draw_dense_clear(
                     writer,
@@ -1012,11 +1012,16 @@ fn encode_dense_rows(
             run.bytes.clear();
         }
 
-        if clear_to_bottom_bg.is_none() && last_nonblank_column + 1 < row.len() {
+        if clear_to_bottom_bg.is_none() {
+            let tail_clear_column =
+                last_nonblank_column + display_width(row[last_nonblank_column].symbol()).max(1);
+            if tail_clear_column >= row.len() {
+                continue;
+            }
             draw_dense_clear(
                 writer,
                 Position {
-                    x: buffer.area.x + (last_nonblank_column + 1) as u16,
+                    x: buffer.area.x + tail_clear_column as u16,
                     y: buffer.area.y + y,
                 },
                 row_bg,
@@ -1127,11 +1132,14 @@ fn draw_dense_clear(
 }
 
 fn last_nonblank_column(row: &[Cell], bg: Color) -> Option<usize> {
-    row.iter()
-        .rposition(|cell| {
-            cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty()
-        })
+    last_nonblank_cell_start(row, bg)
         .map(|column| column + display_width(row[column].symbol()).saturating_sub(1))
+}
+
+fn last_nonblank_cell_start(row: &[Cell], bg: Color) -> Option<usize> {
+    row.iter().rposition(|cell| {
+        cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty()
+    })
 }
 
 fn draw<I>(writer: &mut impl Write, commands: I) -> io::Result<()>
