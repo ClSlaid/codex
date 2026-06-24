@@ -2208,8 +2208,8 @@ impl TextArea {
         buf: &mut Buffer,
         state: &mut TextAreaState,
     ) {
-        // Full-row repaint clears the target rows before rendering, so this path only writes cells
-        // that carry text instead of cloning every blank tail cell into the buffer.
+        // Full-row repaint clears the target rows before rendering. For default styling, reuse
+        // cached full rows so dense repaint avoids rebuilding per-cell symbols from UTF-8 text.
         let cache = self.wrapped_cache(area.width);
         let scroll = self.effective_scroll(area.height, &cache.lines, state.scroll);
         state.scroll = scroll;
@@ -2221,20 +2221,7 @@ impl TextArea {
             return;
         }
 
-        let mut rendered_lines = cache.rendered_lines.borrow_mut();
-        for (row, idx) in (start..end).enumerate() {
-            let y = area.y + row as u16;
-            let rendered_line = rendered_lines[idx].get_or_insert_with(|| {
-                rendered_line_for_range(&cache.text, &cache.lines[idx], cache.width)
-            });
-            for cell in &rendered_line.cells {
-                let x = area.x + cell.col;
-                if x.saturating_add(cell.width) > area.right() {
-                    break;
-                }
-                buf[(x, y)].set_symbol(&cache.text[cell.range.clone()]);
-            }
-        }
+        Self::render_default_cached_lines(area, buf, &cache, start..end);
     }
 
     fn render_lines(

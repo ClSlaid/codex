@@ -507,14 +507,14 @@ where
         };
 
         // Draw to stdout
-        let dense_rows = match flush {
+        let dense = match flush {
             FrameFlush::Sparse => {
                 self.flush()?;
-                None
+                false
             }
             FrameFlush::Dense(rows) => {
-                self.flush_dense_rows(rows.clone())?;
-                Some(rows)
+                self.flush_dense_rows(rows)?;
+                true
             }
         };
 
@@ -527,9 +527,10 @@ where
             }
         }
 
-        match dense_rows {
-            Some(rows) => self.swap_buffers_after_dense_rows(rows),
-            None => self.swap_buffers(),
+        if dense {
+            self.swap_buffers_after_dense_rows();
+        } else {
+            self.swap_buffers();
         }
 
         Backend::flush(&mut self.backend)?;
@@ -567,6 +568,7 @@ where
         };
         let render = started.elapsed();
 
+        let dense = matches!(flush, FrameFlush::Dense(_));
         let dense_rows = match flush {
             FrameFlush::Sparse => None,
             FrameFlush::Dense(rows) => Some(rows),
@@ -585,9 +587,10 @@ where
         let cursor = started.elapsed();
 
         let started = Instant::now();
-        match dense_rows {
-            Some(rows) => self.swap_buffers_after_dense_rows(rows),
-            None => self.swap_buffers(),
+        if dense {
+            self.swap_buffers_after_dense_rows();
+        } else {
+            self.swap_buffers();
         }
         let buffer_swap = started.elapsed();
 
@@ -739,13 +742,11 @@ where
         self.current = 1 - self.current;
     }
 
-    fn swap_buffers_after_dense_rows(&mut self, rows: Range<u16>) {
-        self.reset_inactive_rows(rows);
+    fn swap_buffers_after_dense_rows(&mut self) {
+        // Dense renderers clear their repaint rows before writing into the frame. The inactive
+        // buffer is only the next render target; sparse draws render the full frame, and dense
+        // draws clear their target rows before rendering.
         self.current = 1 - self.current;
-    }
-
-    fn reset_inactive_rows(&mut self, rows: Range<u16>) {
-        clear_buffer_rows(self.previous_buffer_mut(), rows);
     }
 
     /// Queries the real size of the backend.
@@ -1477,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_rows_resets_only_repainted_rows_for_next_frame() {
+    fn dense_rows_update_flushed_rows_when_caller_clears_rows() {
         let area = Rect::new(0, 0, 4, 2);
         let mut terminal =
             Terminal::with_options(CaptureBackend::new(/*width*/ 4, /*height*/ 2))
@@ -1497,9 +1498,7 @@ mod tests {
 
         terminal
             .draw_with_flush(|frame| {
-                frame
-                    .buffer_mut()
-                    .set_string(0, 0, "aaaa", Style::default());
+                frame.clear_rows(1..2);
                 frame
                     .buffer_mut()
                     .set_string(0, 1, "cccc", Style::default());
@@ -1507,15 +1506,30 @@ mod tests {
             })
             .expect("dense draw");
 
-        let row_text = |row: usize| {
+        fn previous_row_text(
+            terminal: &Terminal<CaptureBackend>,
+            area: Rect,
+            row: usize,
+        ) -> String {
             let start = row * usize::from(area.width);
-            terminal.current_buffer().content[start..start + usize::from(area.width)]
+            terminal.previous_buffer().content[start..start + usize::from(area.width)]
                 .iter()
                 .map(Cell::symbol)
                 .collect::<String>()
-        };
-        assert_eq!("aaaa", row_text(0));
-        assert_eq!("    ", row_text(1));
+        }
+        assert_eq!("cccc", previous_row_text(&terminal, area, 1));
+
+        terminal
+            .draw_with_flush(|frame| {
+                frame.clear_rows(1..2);
+                frame
+                    .buffer_mut()
+                    .set_string(0, 1, "dddd", Style::default());
+                FrameFlush::Dense(1..2)
+            })
+            .expect("second dense draw");
+
+        assert_eq!("dddd", previous_row_text(&terminal, area, 1));
     }
 
     #[test]
