@@ -3,7 +3,31 @@
 use super::*;
 
 impl ChatWidget {
+    pub(crate) fn take_dense_render_rows(&mut self, area: Rect) -> Option<std::ops::Range<u16>> {
+        let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
+        let bottom_pane_height = self
+            .bottom_pane
+            .desired_height_with_composer_right_reserve(area.width, active_cell_right_reserve)
+            .saturating_add(1)
+            .min(area.height);
+        let bottom_pane_top = area.bottom().saturating_sub(bottom_pane_height);
+        let previous_top = self.last_bottom_pane_top.replace(bottom_pane_top);
+        if !self.bottom_pane.take_dense_composer_render_pending() {
+            return None;
+        }
+        let previous_top = previous_top?;
+        let top = previous_top.min(bottom_pane_top);
+        (top < area.bottom()).then_some(top..area.bottom())
+    }
+
     pub(super) fn as_renderable(&self) -> RenderableItem<'_> {
+        self.as_renderable_with_bottom_pane_mode(BottomPaneRenderMode::Normal)
+    }
+
+    fn as_renderable_with_bottom_pane_mode(
+        &self,
+        bottom_pane_render_mode: BottomPaneRenderMode,
+    ) -> RenderableItem<'_> {
         let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
         let active_cell_renderable = match &self.transcript.active_cell {
             Some(cell) => RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
@@ -51,6 +75,7 @@ impl ChatWidget {
             RenderableItem::Owned(Box::new(BottomPaneComposerReserveRenderable {
                 bottom_pane: &self.bottom_pane,
                 right_reserve: active_cell_right_reserve,
+                render_mode: bottom_pane_render_mode,
             }))
             .inset(Insets::tlbr(
                 /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
@@ -60,15 +85,29 @@ impl ChatWidget {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BottomPaneRenderMode {
+    Normal,
+    DenseRender,
+}
+
 struct BottomPaneComposerReserveRenderable<'a> {
     bottom_pane: &'a BottomPane,
     right_reserve: u16,
+    render_mode: BottomPaneRenderMode,
 }
 
 impl Renderable for BottomPaneComposerReserveRenderable<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.bottom_pane
-            .render_with_composer_right_reserve(area, buf, self.right_reserve);
+        match self.render_mode {
+            BottomPaneRenderMode::Normal => {
+                self.bottom_pane
+                    .render_with_composer_right_reserve(area, buf, self.right_reserve)
+            }
+            BottomPaneRenderMode::DenseRender => self
+                .bottom_pane
+                .render_dense_with_composer_right_reserve(area, buf, self.right_reserve),
+        }
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -145,5 +184,13 @@ impl Renderable for ChatWidget {
 
     fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle {
         self.as_renderable().cursor_style(area)
+    }
+}
+
+impl ChatWidget {
+    pub(crate) fn render_dense(&self, area: Rect, buf: &mut Buffer) {
+        self.as_renderable_with_bottom_pane_mode(BottomPaneRenderMode::DenseRender)
+            .render(area, buf);
+        self.last_rendered_width.set(Some(area.width as usize));
     }
 }

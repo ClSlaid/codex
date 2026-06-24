@@ -1014,7 +1014,7 @@ impl Tui {
     pub fn draw_with_resize_reflow(
         &mut self,
         height: u16,
-        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame) -> custom_terminal::FrameFlush,
     ) -> Result<()> {
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
         // in the synchronized update.
@@ -1058,9 +1058,7 @@ impl Tui {
                 self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
-            terminal.draw(|frame| {
-                draw_fn(frame);
-            })
+            terminal.draw_with_flush(draw_fn)
         })?
     }
 

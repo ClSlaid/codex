@@ -1341,11 +1341,21 @@ See the Codex keymap documentation for supported actions and examples."
         tui.draw_with_resize_reflow(desired_height, |frame| {
             let area = frame.area();
             rendered_area = area;
-            self.chat_widget.render(area, frame.buffer);
+            let dense_rows = self.chat_widget.take_dense_render_rows(area);
+            if let Some(rows) = dense_rows.clone() {
+                frame.clear_rows(rows);
+                self.chat_widget.render_dense(area, frame.buffer);
+            } else {
+                self.chat_widget.render(area, frame.buffer);
+            }
             if let Some((x, y)) = self.chat_widget.cursor_pos(area) {
                 frame.set_cursor_style(self.chat_widget.cursor_style(area));
                 frame.set_cursor_position((x, y));
             }
+            dense_rows.map_or(
+                crate::custom_terminal::FrameFlush::Sparse,
+                crate::custom_terminal::FrameFlush::Dense,
+            )
         })?;
         Ok(rendered_area)
     }

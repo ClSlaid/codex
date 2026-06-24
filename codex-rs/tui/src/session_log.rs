@@ -197,6 +197,35 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
             });
             LOGGER.write_json_line(value);
         }
+        AppEvent::PrewarmHistoryEntryRenderCache {
+            thread_id,
+            key,
+            width,
+            text,
+        } => {
+            let value = json!({
+                "ts": now_ts(),
+                "dir": "to_tui",
+                "kind": "app_event",
+                "variant": "PrewarmHistoryEntryRenderCache",
+                "thread_id": thread_id.to_string(),
+                "key": format!("{key:?}"),
+                "width": width,
+                "text_bytes": text.len(),
+            });
+            LOGGER.write_json_line(value);
+        }
+        AppEvent::ThreadHistoryEntryRenderCacheReady { thread_id, cache } => {
+            let value = json!({
+                "ts": now_ts(),
+                "dir": "to_tui",
+                "kind": "app_event",
+                "variant": "ThreadHistoryEntryRenderCacheReady",
+                "thread_id": thread_id.to_string(),
+                "width": cache.width(),
+            });
+            LOGGER.write_json_line(value);
+        }
         // Noise or control flow – record variant only
         other => {
             let value = json!({

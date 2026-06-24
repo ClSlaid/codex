@@ -14,19 +14,25 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::app_event::AppEvent;
+use crate::app_event::HistoryLookupPrewarm;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::textarea::TextAreaHistoryCacheKey;
 use crate::mention_codec::decode_history_mentions_with_at_mentions;
 use codex_protocol::ThreadId;
 use codex_protocol::user_input::TextElement;
 
 /// A composer history entry that can rehydrate draft state.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct HistoryEntry {
+    /// Stable identity used for normal recall/cache lookup. The prompt text remains payload, not
+    /// the index for render-cache reuse.
+    pub(crate) cache_key: Option<TextAreaHistoryCacheKey>,
     /// Raw text stored in history (may include placeholder strings).
-    pub(crate) text: String,
+    pub(crate) text: Arc<str>,
     /// Text element ranges for placeholders inside `text`.
     pub(crate) text_elements: Vec<TextElement>,
     /// Local image paths captured alongside `text_elements`.
@@ -37,6 +43,17 @@ pub(crate) struct HistoryEntry {
     pub(crate) mention_bindings: Vec<MentionBinding>,
     /// Placeholder-to-payload pairs used to restore large paste content.
     pub(crate) pending_pastes: Vec<(String, String)>,
+}
+
+impl PartialEq for HistoryEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.text_elements == other.text_elements
+            && self.local_image_paths == other.local_image_paths
+            && self.remote_image_urls == other.remote_image_urls
+            && self.mention_bindings == other.mention_bindings
+            && self.pending_pastes == other.pending_pastes
+    }
 }
 
 impl HistoryEntry {
@@ -53,7 +70,8 @@ impl HistoryEntry {
     pub(crate) fn new_with_at_mentions(text: String, at_mentions_enabled: bool) -> Self {
         let decoded = decode_history_mentions_with_at_mentions(&text, at_mentions_enabled);
         Self {
-            text: decoded.text,
+            cache_key: None,
+            text: Arc::from(decoded.text),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
@@ -78,7 +96,8 @@ impl HistoryEntry {
         pending_pastes: Vec<(String, String)>,
     ) -> Self {
         Self {
-            text,
+            cache_key: None,
+            text: Arc::from(text),
             text_elements,
             local_image_paths,
             remote_image_urls: Vec::new(),
@@ -96,7 +115,8 @@ impl HistoryEntry {
         remote_image_urls: Vec<String>,
     ) -> Self {
         Self {
-            text,
+            cache_key: None,
+            text: Arc::from(text),
             text_elements,
             local_image_paths,
             remote_image_urls,
@@ -123,6 +143,7 @@ pub(crate) struct ChatComposerHistory {
     local_history: Vec<HistoryEntry>,
     /// Local entries seeded from resumed transcript replay.
     replay_seeded_history: Vec<HistoryEntry>,
+    next_local_history_cache_id: u64,
 
     /// Cache of persistent history entries fetched on-demand (text-only).
     fetched_history: HashMap<usize, HistoryEntry>,
@@ -132,14 +153,16 @@ pub(crate) struct ChatComposerHistory {
     history_cursor: Option<isize>,
     pending_navigation_direction: Option<HistorySearchDirection>,
 
-    /// The text that was last inserted into the composer as a result of
-    /// history navigation. Used to decide if further Up/Down presses should be
-    /// treated as navigation versus normal cursor movement, together with the
-    /// "cursor at line boundary" check in [`Self::should_handle_navigation`].
-    last_history_text: Option<String>,
+    /// Identity of the history entry last inserted into the composer by recall. Used to decide if
+    /// further Up/Down presses should be treated as navigation versus normal cursor movement,
+    /// together with the caller's line-boundary check in [`Self::should_handle_navigation`].
+    last_history_cache_key: Option<TextAreaHistoryCacheKey>,
 
     /// Active incremental history search, if Ctrl+R search mode is open.
     search: Option<HistorySearchState>,
+    prewarm_width: Option<u16>,
+    pending_prewarm_offsets: HashSet<usize>,
+    completed_prewarm_offsets: HashSet<usize>,
     /// Whether persistent history restore should rehydrate `@` tool mentions.
     at_mention_restore_enabled: bool,
 }
@@ -191,7 +214,7 @@ struct HistorySearchState {
     selected_offset: Option<usize>,
     unique_matches: Vec<UniqueHistoryMatch>,
     selected_match_index: Option<usize>,
-    seen_texts: HashSet<String>,
+    seen_texts: HashSet<Arc<str>>,
     awaiting: Option<PendingHistorySearch>,
     exhausted_older: bool,
     exhausted_newer: bool,
@@ -233,11 +256,15 @@ impl ChatComposerHistory {
             persistent_entry_count: 0,
             local_history: Vec::new(),
             replay_seeded_history: Vec::new(),
+            next_local_history_cache_id: 1,
             fetched_history: HashMap::new(),
             history_cursor: None,
             pending_navigation_direction: None,
-            last_history_text: None,
+            last_history_cache_key: None,
             search: None,
+            prewarm_width: None,
+            pending_prewarm_offsets: HashSet::new(),
+            completed_prewarm_offsets: HashSet::new(),
             at_mention_restore_enabled: false,
         }
     }
@@ -249,8 +276,9 @@ impl ChatComposerHistory {
         self.at_mention_restore_enabled = enabled;
         self.fetched_history.clear();
         self.history_cursor = None;
-        self.last_history_text = None;
+        self.last_history_cache_key = None;
         self.search = None;
+        self.clear_prewarm_cache();
     }
 
     /// Updates persistent history metadata when a new session is configured.
@@ -265,27 +293,95 @@ impl ChatComposerHistory {
         self.fetched_history.clear();
         self.local_history.clear();
         self.replay_seeded_history.clear();
+        self.next_local_history_cache_id = 1;
         self.history_cursor = None;
         self.pending_navigation_direction = None;
-        self.last_history_text = None;
+        self.last_history_cache_key = None;
         self.search = None;
+        self.clear_prewarm_cache();
     }
 
     /// Records a current-session submission so it can be recalled with full draft metadata.
     ///
     /// Empty submissions are ignored, adjacent duplicates are collapsed, and active navigation or
     /// search state is reset because a new newest entry changes the combined history offset space.
+    #[cfg(test)]
     pub fn record_local_submission(&mut self, entry: HistoryEntry) {
-        self.record_local_submission_inner(entry);
+        let _ = self.record_local_submission_inner(entry);
     }
 
-    pub fn record_replayed_submission(&mut self, entry: HistoryEntry) {
-        if self.record_local_submission_inner(entry.clone()) {
-            self.replay_seeded_history.push(entry);
+    pub fn record_local_submission_for_recall(
+        &mut self,
+        entry: HistoryEntry,
+    ) -> Option<HistoryEntry> {
+        self.record_local_submission_inner(entry)
+    }
+
+    pub fn record_replayed_submission_for_recall(
+        &mut self,
+        entry: HistoryEntry,
+    ) -> Option<HistoryEntry> {
+        let entry = self.record_local_submission_inner(entry)?;
+        self.replay_seeded_history.push(entry.clone());
+        Some(entry)
+    }
+
+    fn clear_prewarm_cache(&mut self) {
+        self.prewarm_width = None;
+        self.pending_prewarm_offsets.clear();
+        self.completed_prewarm_offsets.clear();
+    }
+
+    pub fn set_prewarm_width(&mut self, width: u16) {
+        if self.prewarm_width == Some(width) {
+            return;
+        }
+        self.prewarm_width = Some(width);
+        self.pending_prewarm_offsets.clear();
+        self.completed_prewarm_offsets.clear();
+    }
+
+    pub fn schedule_recent_prewarm(&mut self, limit: usize, app_event_tx: &AppEventSender) {
+        let (Some(thread_id), Some(log_id)) = (self.thread_id, self.persistent_log_id) else {
+            return;
+        };
+        let Some(width) = self.prewarm_width else {
+            return;
+        };
+        let start = self.persistent_entry_count.saturating_sub(limit);
+        for offset in (start..self.persistent_entry_count).rev() {
+            if self.pending_prewarm_offsets.contains(&offset)
+                || self.completed_prewarm_offsets.contains(&offset)
+            {
+                continue;
+            }
+            self.pending_prewarm_offsets.insert(offset);
+            app_event_tx.send(AppEvent::LookupMessageHistoryEntry {
+                thread_id,
+                offset,
+                log_id,
+                prewarm: Some(HistoryLookupPrewarm {
+                    width,
+                    at_mentions_enabled: self.at_mention_restore_enabled,
+                }),
+            });
         }
     }
 
-    fn record_local_submission_inner(&mut self, entry: HistoryEntry) -> bool {
+    pub fn recent_local_history_entries(&self, limit: usize) -> Vec<HistoryEntry> {
+        self.local_history
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn thread_id(&self) -> Option<ThreadId> {
+        self.thread_id
+    }
+
+    fn record_local_submission_inner(&mut self, mut entry: HistoryEntry) -> Option<HistoryEntry> {
         if entry.text.is_empty()
             && entry.text_elements.is_empty()
             && entry.local_image_paths.is_empty()
@@ -293,20 +389,27 @@ impl ChatComposerHistory {
             && entry.mention_bindings.is_empty()
             && entry.pending_pastes.is_empty()
         {
-            return false;
+            return None;
         }
         self.history_cursor = None;
         self.pending_navigation_direction = None;
-        self.last_history_text = None;
+        self.last_history_cache_key = None;
         self.search = None;
 
         // Avoid inserting a duplicate if identical to the previous entry.
         if self.local_history.last().is_some_and(|prev| prev == &entry) {
-            return false;
+            return None;
         }
 
-        self.local_history.push(entry);
-        true
+        entry.cache_key = Some(self.next_local_history_cache_key());
+        self.local_history.push(entry.clone());
+        Some(entry)
+    }
+
+    fn next_local_history_cache_key(&mut self) -> TextAreaHistoryCacheKey {
+        let id = self.next_local_history_cache_id;
+        self.next_local_history_cache_id = self.next_local_history_cache_id.wrapping_add(1).max(1);
+        TextAreaHistoryCacheKey::Local(id)
     }
 
     /// Resets normal history navigation so the next Up key resumes from the newest entry.
@@ -317,7 +420,7 @@ impl ChatComposerHistory {
     pub fn reset_navigation(&mut self) {
         self.history_cursor = None;
         self.pending_navigation_direction = None;
-        self.last_history_text = None;
+        self.last_history_cache_key = None;
         self.search = None;
     }
 
@@ -334,30 +437,35 @@ impl ChatComposerHistory {
     ///
     /// Empty text always enables history traversal. For non-empty text, this requires both:
     ///
-    /// - the current text exactly matching the last recalled history entry, and
+    /// - the current buffer still carrying the last recalled history identity, and
     /// - the cursor being at a line boundary (start or end).
     ///
     /// This boundary gate keeps multiline cursor movement usable while preserving shell-like
     /// history recall. If callers moved the cursor into the middle of a recalled entry and still
     /// forced navigation, users would lose normal vertical movement within the draft.
-    pub fn should_handle_navigation(&self, text: &str, cursor: usize) -> bool {
+    pub fn should_handle_navigation(
+        &self,
+        text_is_empty: bool,
+        current_history_cache_key: Option<TextAreaHistoryCacheKey>,
+        cursor_at_boundary: bool,
+    ) -> bool {
         if self.persistent_entry_count == 0 && self.local_history.is_empty() {
             return false;
         }
 
-        if text.is_empty() {
+        if text_is_empty {
             return true;
         }
 
-        // Textarea is not empty – only navigate when text matches the last
-        // recalled history entry and the cursor is at a line boundary. This
-        // keeps shell-like Up/Down recall working while still allowing normal
-        // multiline cursor movement from interior positions.
-        if cursor != 0 && cursor != text.len() {
+        // Textarea is not empty – only navigate when the buffer still represents the same recalled
+        // history entry and the cursor is at a line boundary. This keeps shell-like Up/Down recall
+        // working while still allowing normal multiline cursor movement from interior positions.
+        if !cursor_at_boundary {
             return false;
         }
 
-        matches!(&self.last_history_text, Some(prev) if prev == text)
+        self.last_history_cache_key.is_some()
+            && self.last_history_cache_key == current_history_cache_key
     }
 
     /// Handles Up by moving toward older entries in the combined history space.
@@ -417,7 +525,7 @@ impl ChatComposerHistory {
                 // Past newest – clear and exit browsing mode.
                 self.history_cursor = None;
                 self.pending_navigation_direction = None;
-                self.last_history_text = None;
+                self.last_history_cache_key = None;
                 Some(HistoryEntry::new(String::new()))
             }
         }
@@ -440,9 +548,15 @@ impl ChatComposerHistory {
         if self.persistent_log_id != Some(log_id) {
             return HistoryEntryResponse::Ignored;
         }
+        if self.pending_prewarm_offsets.remove(&offset) {
+            self.completed_prewarm_offsets.insert(offset);
+        }
 
         let entry = entry.map(|entry| {
-            HistoryEntry::new_with_at_mentions(entry, self.at_mention_restore_enabled)
+            let mut entry =
+                HistoryEntry::new_with_at_mentions(entry, self.at_mention_restore_enabled);
+            entry.cache_key = Some(TextAreaHistoryCacheKey::Persistent { log_id, offset });
+            entry
         });
         if let Some(entry) = entry.clone() {
             self.fetched_history.insert(offset, entry);
@@ -494,7 +608,7 @@ impl ChatComposerHistory {
                     .map(HistoryEntryResponse::Found)
                     .unwrap_or(HistoryEntryResponse::Ignored);
             }
-            self.last_history_text = Some(entry.text.clone());
+            self.last_history_cache_key = entry.cache_key;
             return HistoryEntryResponse::Found(entry);
         }
 
@@ -669,6 +783,7 @@ impl ChatComposerHistory {
                     thread_id,
                     offset,
                     log_id,
+                    prewarm: None,
                 });
                 return HistorySearchResult::Pending;
             }
@@ -708,12 +823,12 @@ impl ChatComposerHistory {
     fn search_result_is_unique(&self, entry: &HistoryEntry) -> bool {
         self.search
             .as_ref()
-            .is_none_or(|search| !search.seen_texts.contains(entry.text.as_str()))
+            .is_none_or(|search| !search.seen_texts.contains(entry.text.as_ref()))
     }
 
     fn search_match(&mut self, offset: usize, entry: HistoryEntry) -> HistorySearchResult {
         self.history_cursor = Some(offset as isize);
-        self.last_history_text = Some(entry.text.clone());
+        self.last_history_cache_key = entry.cache_key;
         if let Some(search) = self.search.as_mut() {
             search.selected_offset = Some(offset);
             search.record_match(offset, &entry);
@@ -742,7 +857,7 @@ impl ChatComposerHistory {
 
         let history_match = self.search.as_ref()?.unique_matches[next_index].clone();
         self.history_cursor = Some(history_match.offset as isize);
-        self.last_history_text = Some(history_match.entry.text.clone());
+        self.last_history_cache_key = history_match.entry.cache_key;
         if let Some(search) = self.search.as_mut() {
             search.select_match(next_index);
         }
@@ -789,7 +904,7 @@ impl ChatComposerHistory {
                     continue;
                 }
                 self.pending_navigation_direction = None;
-                self.last_history_text = Some(entry.text.clone());
+                self.last_history_cache_key = entry.cache_key;
                 return Some(entry);
             }
 
@@ -803,6 +918,7 @@ impl ChatComposerHistory {
                     thread_id,
                     offset: global_idx,
                     log_id,
+                    prewarm: None,
                 });
             }
             return None;
@@ -952,7 +1068,11 @@ mod tests {
         assert_eq!(
             disabled,
             HistoryEntryResponse::Found(HistoryEntry {
-                text: "$sample and $figma".to_string(),
+                cache_key: Some(TextAreaHistoryCacheKey::Persistent {
+                    log_id: 42,
+                    offset: 0,
+                }),
+                text: "$sample and $figma".into(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
                 remote_image_urls: Vec::new(),
@@ -983,7 +1103,11 @@ mod tests {
         assert_eq!(
             enabled,
             HistoryEntryResponse::Found(HistoryEntry {
-                text: "@sample and $figma".to_string(),
+                cache_key: Some(TextAreaHistoryCacheKey::Persistent {
+                    log_id: 42,
+                    offset: 0,
+                }),
+                text: "@sample and $figma".into(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
                 remote_image_urls: Vec::new(),
@@ -1016,7 +1140,10 @@ mod tests {
         history.record_local_submission(HistoryEntry::new("latest".to_string()));
 
         // First Up should recall current-session local history.
-        assert!(history.should_handle_navigation("", /*cursor*/ 0));
+        assert!(history.should_handle_navigation(
+            /*text_is_empty*/ true, /*current_history_cache_key*/ None,
+            /*cursor_at_boundary*/ true
+        ));
         assert_eq!(
             Some(HistoryEntry::new("latest".to_string())),
             history.navigate_up(&tx)
@@ -1031,6 +1158,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = event
         else {
             panic!("unexpected event variant");
@@ -1038,6 +1166,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 2);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         // Inject the async response.
         assert_eq!(
@@ -1059,6 +1188,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = event2
         else {
             panic!("unexpected event variant");
@@ -1066,6 +1196,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 1);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         assert_eq!(
             HistoryEntryResponse::Found(HistoryEntry::new("older".to_string())),
@@ -1297,6 +1428,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = rx.try_recv().expect("expected latest lookup")
         else {
             panic!("unexpected event variant");
@@ -1304,6 +1436,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 2);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         assert_eq!(
             HistoryEntryResponse::Search(HistorySearchResult::Pending),
@@ -1318,6 +1451,7 @@ mod tests {
             thread_id: response_thread_id,
             offset,
             log_id,
+            prewarm,
         } = rx.try_recv().expect("expected next lookup")
         else {
             panic!("unexpected event variant");
@@ -1325,6 +1459,7 @@ mod tests {
         assert_eq!(response_thread_id, thread_id);
         assert_eq!(offset, 1);
         assert_eq!(log_id, 1);
+        assert_eq!(prewarm, None);
 
         assert_eq!(
             HistoryEntryResponse::Search(HistorySearchResult::Found(HistoryEntry::new(
@@ -1483,7 +1618,7 @@ mod tests {
 
         history.reset_navigation();
         assert!(history.history_cursor.is_none());
-        assert!(history.last_history_text.is_none());
+        assert!(history.last_history_cache_key.is_none());
 
         assert_eq!(
             Some(HistoryEntry::new("command3".to_string())),
@@ -1495,11 +1630,23 @@ mod tests {
     fn should_handle_navigation_when_cursor_is_at_line_boundaries() {
         let mut history = ChatComposerHistory::new();
         history.record_local_submission(HistoryEntry::new("hello".to_string()));
-        history.last_history_text = Some("hello".to_string());
+        let key = TextAreaHistoryCacheKey::Local(1);
+        history.last_history_cache_key = Some(key);
 
-        assert!(history.should_handle_navigation("hello", /*cursor*/ 0));
-        assert!(history.should_handle_navigation("hello", "hello".len()));
-        assert!(!history.should_handle_navigation("hello", /*cursor*/ 1));
-        assert!(!history.should_handle_navigation("other", /*cursor*/ 0));
+        assert!(history.should_handle_navigation(
+            /*text_is_empty*/ false,
+            Some(key),
+            /*cursor_at_boundary*/ true
+        ));
+        assert!(!history.should_handle_navigation(
+            /*text_is_empty*/ false,
+            Some(key),
+            /*cursor_at_boundary*/ false
+        ));
+        assert!(!history.should_handle_navigation(
+            /*text_is_empty*/ false,
+            Some(TextAreaHistoryCacheKey::Local(2)),
+            /*cursor_at_boundary*/ true
+        ));
     }
 }

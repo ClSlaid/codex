@@ -39,8 +39,10 @@ use codex_utils_approval_presets::ApprovalPreset;
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerStartedThread;
 use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::PreparedWrapCache;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
+use crate::bottom_pane::TextAreaHistoryCacheKey;
 use crate::chatwidget::UserMessage;
 use crate::goal_files::GoalDraft;
 use codex_app_server_protocol::AskForApproval;
@@ -138,6 +140,12 @@ pub(crate) enum KeymapEditIntent {
     ReplaceOne { old_key: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryLookupPrewarm {
+    pub(crate) width: u16,
+    pub(crate) at_mentions_enabled: bool,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -164,6 +172,20 @@ pub(crate) enum AppEvent {
         event: HistoryLookupResponse,
     },
 
+    /// Prepare a current-session history entry render cache off the input path.
+    PrewarmHistoryEntryRenderCache {
+        thread_id: ThreadId,
+        key: TextAreaHistoryCacheKey,
+        width: u16,
+        text: String,
+    },
+
+    /// Deliver a prepared current-session history entry render cache to its owning thread.
+    ThreadHistoryEntryRenderCacheReady {
+        thread_id: ThreadId,
+        cache: PreparedWrapCache,
+    },
+
     /// Persist a submitted prompt in the cross-session message history.
     AppendMessageHistoryEntry {
         thread_id: ThreadId,
@@ -181,6 +203,7 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
         offset: usize,
         log_id: u64,
+        prewarm: Option<HistoryLookupPrewarm>,
     },
 
     /// Start a new session.

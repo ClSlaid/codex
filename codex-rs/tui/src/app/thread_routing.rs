@@ -5,6 +5,8 @@
 //! when the visible thread changes.
 
 use super::*;
+use crate::app_event::HistoryLookupPrewarm;
+use crate::bottom_pane::TextAreaHistoryCacheKey;
 use crate::session_resume::read_session_model;
 
 impl App {
@@ -480,6 +482,7 @@ impl App {
         thread_id: ThreadId,
         offset: usize,
         log_id: u64,
+        prewarm: Option<HistoryLookupPrewarm>,
     ) -> Result<()> {
         let history_config = codex_message_history::HistoryConfig::new(
             self.chat_widget.config_ref().codex_home.clone(),
@@ -487,14 +490,33 @@ impl App {
         );
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let entry_opt = tokio::task::spawn_blocking(move || {
-                codex_message_history::lookup(log_id, offset, &history_config)
+            let lookup_result = tokio::task::spawn_blocking(move || {
+                let entry_opt = codex_message_history::lookup(log_id, offset, &history_config);
+                let prewarmed_wrap_cache = entry_opt.as_ref().and_then(|entry| {
+                    prewarm.map(|prewarm| {
+                        let decoded =
+                            crate::mention_codec::decode_history_mentions_with_at_mentions(
+                                &entry.text,
+                                prewarm.at_mentions_enabled,
+                            );
+                        crate::bottom_pane::prepare_textarea_wrap_cache(
+                            TextAreaHistoryCacheKey::Persistent { log_id, offset },
+                            prewarm.width,
+                            decoded.text,
+                        )
+                    })
+                });
+                (entry_opt, prewarmed_wrap_cache)
             })
-            .await
-            .unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "history lookup task failed");
-                None
-            });
+            .await;
+
+            let (entry_opt, prewarmed_wrap_cache) = match lookup_result {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(error = %err, "history lookup task failed");
+                    (None, None)
+                }
+            };
 
             app_event_tx.send(AppEvent::ThreadHistoryEntryResponse {
                 thread_id,
@@ -504,6 +526,35 @@ impl App {
                     entry: entry_opt.map(|entry| entry.text),
                 },
             });
+            if let Some(cache) = prewarmed_wrap_cache {
+                app_event_tx
+                    .send(AppEvent::ThreadHistoryEntryRenderCacheReady { thread_id, cache });
+            }
+        });
+        Ok(())
+    }
+
+    pub(super) async fn prewarm_history_entry_render_cache(
+        &mut self,
+        thread_id: ThreadId,
+        key: TextAreaHistoryCacheKey,
+        width: u16,
+        text: String,
+    ) -> Result<()> {
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let cache = tokio::task::spawn_blocking(move || {
+                crate::bottom_pane::prepare_textarea_wrap_cache(key, width, text)
+            })
+            .await;
+
+            match cache {
+                Ok(cache) => app_event_tx
+                    .send(AppEvent::ThreadHistoryEntryRenderCacheReady { thread_id, cache }),
+                Err(err) => {
+                    tracing::warn!(error = %err, "history render-cache prewarm task failed");
+                }
+            }
         });
         Ok(())
     }

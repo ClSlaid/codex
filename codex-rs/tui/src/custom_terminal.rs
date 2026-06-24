@@ -23,6 +23,11 @@
 // SOFTWARE.
 use std::io;
 use std::io::Write;
+use std::ops::Range;
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use crossterm::cursor::MoveTo;
 use crossterm::cursor::SetCursorStyle;
@@ -55,6 +60,13 @@ use unicode_width::UnicodeWidthStr;
 /// This function strips them first so that only visible characters contribute
 /// to the width.
 fn display_width(s: &str) -> usize {
+    if s == " " {
+        return 1;
+    }
+    if s.len() == 1 && s.as_bytes()[0].is_ascii_graphic() {
+        return 1;
+    }
+
     // Fast path: no escape sequences present.
     if !s.contains('\x1B') {
         return s.width();
@@ -94,6 +106,30 @@ pub struct Frame<'a> {
 
     /// The buffer that is used to draw the current frame
     pub(crate) buffer: &'a mut Buffer,
+}
+
+#[derive(Debug)]
+pub(crate) enum FrameFlush {
+    Sparse,
+    /// Repaint a dense row range without diffing against the previous buffer.
+    ///
+    /// Callers that use an optimized renderer which skips blank cells must clear the same rows in
+    /// the frame buffer before rendering; the terminal only controls flushing and buffer swapping.
+    Dense(Range<u16>),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TerminalDrawTimings {
+    pub(crate) autoresize: Duration,
+    pub(crate) render: Duration,
+    pub(crate) diff: Duration,
+    pub(crate) encode: Duration,
+    pub(crate) cursor: Duration,
+    pub(crate) buffer_swap: Duration,
+    pub(crate) backend_flush: Duration,
+    pub(crate) total: Duration,
+    pub(crate) commands: usize,
 }
 
 impl Frame<'_> {
@@ -139,6 +175,11 @@ impl Frame<'_> {
     /// Gets the buffer that this `Frame` draws into as a mutable reference.
     pub fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer
+    }
+
+    /// Clear rows in the in-progress frame before a dense partial renderer writes into them.
+    pub(crate) fn clear_rows(&mut self, rows: Range<u16>) {
+        clear_buffer_rows(self.buffer, rows);
     }
 }
 
@@ -296,6 +337,45 @@ where
         draw(&mut self.backend, updates.into_iter())
     }
 
+    fn flush_dense_rows(&mut self, rows: Range<u16>) -> io::Result<()> {
+        let current = self.current;
+        let stats = draw_dense_rows(&mut self.backend, &self.buffers[current], rows)?;
+        if let Some(position) = stats.last_put {
+            self.last_known_cursor_pos = position;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn flush_profiled(
+        &mut self,
+        dense_rows: Option<Range<u16>>,
+    ) -> io::Result<(Duration, Duration, usize)> {
+        if let Some(rows) = dense_rows {
+            let started = Instant::now();
+            let current = self.current;
+            let stats = draw_dense_rows(&mut self.backend, &self.buffers[current], rows)?;
+            let encode = started.elapsed();
+            if let Some(position) = stats.last_put {
+                self.last_known_cursor_pos = position;
+            }
+            return Ok((Duration::ZERO, encode, stats.commands));
+        }
+
+        let started = Instant::now();
+        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
+        let diff = started.elapsed();
+        let commands = updates.len();
+        let last_put_command = updates.iter().rfind(|command| command.is_put());
+        if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
+            self.last_known_cursor_pos = Position { x, y };
+        }
+
+        let started = Instant::now();
+        draw(&mut self.backend, updates.into_iter())?;
+        Ok((diff, started.elapsed(), commands))
+    }
+
     /// Updates the Terminal so that internal buffers match the requested area.
     ///
     /// Requested area will be saved to remain consistent when rendering. This leads to a full clear
@@ -355,6 +435,13 @@ where
         })
     }
 
+    pub(crate) fn draw_with_flush<F>(&mut self, render_callback: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut Frame) -> FrameFlush,
+    {
+        self.try_draw_with_flush(|frame| io::Result::Ok(render_callback(frame)))
+    }
+
     /// Tries to draw a single frame to the terminal.
     ///
     /// Returns [`Result::Ok`] containing a [`CompletedFrame`] if successful, otherwise
@@ -395,22 +482,41 @@ where
         F: FnOnce(&mut Frame) -> Result<(), E>,
         E: Into<io::Error>,
     {
+        self.try_draw_with_flush(|frame| {
+            render_callback(frame).map_err(Into::into)?;
+            io::Result::Ok(FrameFlush::Sparse)
+        })
+    }
+
+    pub(crate) fn try_draw_with_flush<F, E>(&mut self, render_callback: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut Frame) -> Result<FrameFlush, E>,
+        E: Into<io::Error>,
+    {
         // Autoresize - otherwise we get glitches if shrinking or potential desync between widgets
         // and the terminal (if growing), which may OOB.
         self.autoresize()?;
 
-        let mut frame = self.get_frame();
-
-        render_callback(&mut frame).map_err(Into::into)?;
-
         // We can't change the cursor position right away because we have to flush the frame to
         // stdout first. But we also can't keep the frame around, since it holds a &mut to
-        // Buffer. Thus, we're taking the important data out of the Frame and dropping it.
-        let cursor_position = frame.cursor_position;
-        let cursor_style = frame.cursor_style;
+        // Buffer. Thus, we're taking the important data out of the Frame.
+        let (cursor_position, cursor_style, flush) = {
+            let mut frame = self.get_frame();
+            let flush = render_callback(&mut frame).map_err(Into::into)?;
+            (frame.cursor_position, frame.cursor_style, flush)
+        };
 
         // Draw to stdout
-        self.flush()?;
+        let dense = match flush {
+            FrameFlush::Sparse => {
+                self.flush()?;
+                false
+            }
+            FrameFlush::Dense(rows) => {
+                self.flush_dense_rows(rows)?;
+                true
+            }
+        };
 
         match cursor_position {
             None => self.hide_cursor()?,
@@ -421,11 +527,88 @@ where
             }
         }
 
-        self.swap_buffers();
+        if dense {
+            self.swap_buffers_after_dense_rows();
+        } else {
+            self.swap_buffers();
+        }
 
         Backend::flush(&mut self.backend)?;
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn draw_profiled<F>(&mut self, render_callback: F) -> io::Result<TerminalDrawTimings>
+    where
+        F: FnOnce(&mut Frame) -> FrameFlush,
+    {
+        self.try_draw_profiled(|frame| io::Result::Ok(render_callback(frame)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_draw_profiled<F, E>(
+        &mut self,
+        render_callback: F,
+    ) -> io::Result<TerminalDrawTimings>
+    where
+        F: FnOnce(&mut Frame) -> Result<FrameFlush, E>,
+        E: Into<io::Error>,
+    {
+        let total_start = Instant::now();
+        let started = Instant::now();
+        self.autoresize()?;
+        let autoresize = started.elapsed();
+
+        let started = Instant::now();
+        let (cursor_position, cursor_style, flush) = {
+            let mut frame = self.get_frame();
+            let flush = render_callback(&mut frame).map_err(Into::into)?;
+            (frame.cursor_position, frame.cursor_style, flush)
+        };
+        let render = started.elapsed();
+
+        let dense = matches!(flush, FrameFlush::Dense(_));
+        let dense_rows = match flush {
+            FrameFlush::Sparse => None,
+            FrameFlush::Dense(rows) => Some(rows),
+        };
+        let (diff, encode, commands) = self.flush_profiled(dense_rows)?;
+
+        let started = Instant::now();
+        match cursor_position {
+            None => self.hide_cursor()?,
+            Some(position) => {
+                self.set_cursor_style(cursor_style)?;
+                self.show_cursor()?;
+                self.set_cursor_position(position)?;
+            }
+        }
+        let cursor = started.elapsed();
+
+        let started = Instant::now();
+        if dense {
+            self.swap_buffers_after_dense_rows();
+        } else {
+            self.swap_buffers();
+        }
+        let buffer_swap = started.elapsed();
+
+        let started = Instant::now();
+        Backend::flush(&mut self.backend)?;
+        let backend_flush = started.elapsed();
+
+        Ok(TerminalDrawTimings {
+            autoresize,
+            render,
+            diff,
+            encode,
+            cursor,
+            buffer_swap,
+            backend_flush,
+            total: total_start.elapsed(),
+            commands,
+        })
     }
 
     /// Hides the cursor.
@@ -559,6 +742,13 @@ where
         self.current = 1 - self.current;
     }
 
+    fn swap_buffers_after_dense_rows(&mut self) {
+        // Dense renderers clear their repaint rows before writing into the frame. The inactive
+        // buffer is only the next render target; sparse draws render the full frame, and dense
+        // draws clear their target rows before rendering.
+        self.current = 1 - self.current;
+    }
+
     /// Queries the real size of the backend.
     pub fn size(&self) -> io::Result<Size> {
         self.backend.size()
@@ -566,6 +756,24 @@ where
 }
 
 use ratatui::buffer::Cell;
+
+fn clear_buffer_rows(buffer: &mut Buffer, rows: Range<u16>) {
+    let area = buffer.area;
+    let width = usize::from(area.width);
+    if width == 0 {
+        return;
+    }
+
+    let start = rows.start.max(area.y);
+    let end = rows.end.min(area.bottom());
+    if start >= end {
+        return;
+    }
+
+    let start = usize::from(start - area.y) * width;
+    let end = usize::from(end - area.y) * width;
+    buffer.content[start..end].fill(Cell::EMPTY);
+}
 
 #[derive(Debug, IsVariant)]
 enum DrawCommand {
@@ -577,65 +785,308 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
 
-    let mut updates = vec![];
-    let mut last_nonblank_columns = vec![0; a.area.height as usize];
+    let width = usize::from(a.area.width);
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut updates = Vec::new();
     for y in 0..a.area.height {
         let row_start = y as usize * a.area.width as usize;
-        let row_end = row_start + a.area.width as usize;
-        let row = &next_buffer[row_start..row_end];
-        let bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
+        let row_end = row_start + width;
+        let previous_row = &previous_buffer[row_start..row_end];
+        let next_row = &next_buffer[row_start..row_end];
+        if previous_row == next_row {
+            continue;
+        }
+        let bg = next_row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
 
         // Scan the row to find the rightmost column that still matters: any non-space glyph,
         // any cell whose bg differs from the row’s trailing bg, or any cell with modifiers.
         // Multi-width glyphs extend that region through their full displayed width.
         // After that point the rest of the row can be cleared with a single ClearToEnd, a perf win
         // versus emitting multiple space Put commands.
-        let mut last_nonblank_column = 0usize;
+        let last_nonblank_column = last_nonblank_column(next_row, bg).unwrap_or(0);
+
+        // Cells invalidated by drawing/replacing preceding multi-width characters.
+        let mut invalidated: usize = 0;
         let mut column = 0usize;
-        while column < row.len() {
-            let cell = &row[column];
+        while column < next_row.len() && column <= last_nonblank_column {
+            let cell = &next_row[column];
             let width = display_width(cell.symbol());
-            if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
-                last_nonblank_column = column + (width.saturating_sub(1));
+            let step = width.max(1);
+
+            let previous = &previous_row[column];
+            if !cell.skip && (cell != previous || invalidated > 0) {
+                updates.push(DrawCommand::Put {
+                    x: a.area.x + column as u16,
+                    y: a.area.y + y,
+                    cell: cell.clone(),
+                });
             }
-            column += width.max(1); // treat zero-width symbols as width 1
+
+            let affected_width = std::cmp::max(width, display_width(previous.symbol()));
+            invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(step);
+            column += step;
+        }
+
+        if last_nonblank_column + 1 < next_row.len()
+            && previous_row[last_nonblank_column + 1..] != next_row[last_nonblank_column + 1..]
+        {
+            updates.push(DrawCommand::ClearToEnd {
+                x: a.area.x + (last_nonblank_column + 1) as u16,
+                y: a.area.y + y,
+                bg,
+            });
+        }
+    }
+    updates
+}
+
+#[derive(Default)]
+struct DenseDrawStats {
+    last_put: Option<Position>,
+    commands: usize,
+}
+
+#[derive(Debug)]
+struct DenseRun {
+    // Terminal output bytes. Keep this as bytes so dense render does not rebuild
+    // a UTF-8 text container just to pass it back to `Write::write_all`.
+    bytes: Vec<u8>,
+    end_col: usize,
+    position: Position,
+    width: u16,
+    fg: Color,
+    bg: Color,
+    modifier: Modifier,
+}
+
+fn draw_dense_rows(
+    writer: &mut impl Write,
+    buffer: &Buffer,
+    rows: Range<u16>,
+) -> io::Result<DenseDrawStats> {
+    let width = usize::from(buffer.area.width);
+    if width == 0 {
+        return Ok(DenseDrawStats::default());
+    }
+
+    let start = rows.start.max(buffer.area.y);
+    let end = rows.end.min(buffer.area.bottom());
+    if start >= end {
+        return Ok(DenseDrawStats::default());
+    }
+
+    let capacity = width
+        .saturating_mul(usize::from(end - start))
+        .saturating_mul(4);
+    let mut output = Vec::with_capacity(capacity);
+    let stats = encode_dense_rows(&mut output, buffer, start..end, width)?;
+    writer.write_all(&output)?;
+    Ok(stats)
+}
+
+fn encode_dense_rows(
+    writer: &mut impl Write,
+    buffer: &Buffer,
+    rows: Range<u16>,
+    width: usize,
+) -> io::Result<DenseDrawStats> {
+    let mut stats = DenseDrawStats::default();
+    let mut fg = Color::Reset;
+    let mut current_bg = Color::Reset;
+    let mut modifier = Modifier::empty();
+    let mut next_pos: Option<Position> = None;
+    let mut run = DenseRun {
+        bytes: Vec::with_capacity(width.saturating_mul(4)),
+        end_col: 0,
+        position: Position { x: 0, y: 0 },
+        width: 0,
+        fg: Color::Reset,
+        bg: Color::Reset,
+        modifier: Modifier::empty(),
+    };
+
+    for absolute_y in rows {
+        let y = absolute_y - buffer.area.y;
+        let row_start = y as usize * width;
+        let row_end = row_start + width;
+        let row = &buffer.content[row_start..row_end];
+        let row_bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
+        let Some(last_nonblank_column) = last_nonblank_column(row, row_bg) else {
+            draw_dense_clear_to_end(
+                writer,
+                Position {
+                    x: buffer.area.x,
+                    y: buffer.area.y + y,
+                },
+                row_bg,
+                &mut fg,
+                &mut current_bg,
+                &mut modifier,
+                &mut next_pos,
+            )?;
+            stats.commands += 1;
+            continue;
+        };
+
+        let mut column = 0usize;
+        let mut run_active = false;
+        while column < row.len() && column <= last_nonblank_column {
+            let cell = &row[column];
+            if cell.skip {
+                column += 1;
+                continue;
+            }
+
+            let cell_width = display_width(cell.symbol()).max(1);
+            let position = Position {
+                x: buffer.area.x + column as u16,
+                y: buffer.area.y + y,
+            };
+            let cell_width_u16 = cell_width as u16;
+            if run_active
+                && run.end_col == column
+                && run.fg == cell.fg
+                && run.bg == cell.bg
+                && run.modifier == cell.modifier
+            {
+                run.end_col = column + cell_width;
+                run.width = run.width.saturating_add(cell_width_u16);
+                run.bytes.extend_from_slice(cell.symbol().as_bytes());
+            } else {
+                if run_active {
+                    draw_dense_run(
+                        writer,
+                        &run,
+                        &mut fg,
+                        &mut current_bg,
+                        &mut modifier,
+                        &mut next_pos,
+                    )?;
+                    stats.commands += 1;
+                    run.bytes.clear();
+                }
+                run.bytes.extend_from_slice(cell.symbol().as_bytes());
+                run.end_col = column + cell_width;
+                run.position = position;
+                run.width = cell_width_u16;
+                run.fg = cell.fg;
+                run.bg = cell.bg;
+                run.modifier = cell.modifier;
+                run_active = true;
+            }
+            stats.last_put = Some(position);
+            column += cell_width;
+        }
+        if run_active {
+            draw_dense_run(
+                writer,
+                &run,
+                &mut fg,
+                &mut current_bg,
+                &mut modifier,
+                &mut next_pos,
+            )?;
+            stats.commands += 1;
+            run.bytes.clear();
         }
 
         if last_nonblank_column + 1 < row.len() {
-            let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
-            updates.push(DrawCommand::ClearToEnd { x, y, bg });
+            draw_dense_clear_to_end(
+                writer,
+                Position {
+                    x: buffer.area.x + (last_nonblank_column + 1) as u16,
+                    y: buffer.area.y + y,
+                },
+                row_bg,
+                &mut fg,
+                &mut current_bg,
+                &mut modifier,
+                &mut next_pos,
+            )?;
+            stats.commands += 1;
         }
-
-        last_nonblank_columns[y as usize] = last_nonblank_column as u16;
     }
 
-    // Cells invalidated by drawing/replacing preceding multi-width characters:
-    let mut invalidated: usize = 0;
-    // Cells from the current buffer to skip due to preceding multi-width characters taking
-    // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
-    let mut to_skip: usize = 0;
-    for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !current.skip && (current != previous || invalidated > 0) && to_skip == 0 {
-            let (x, y) = a.pos_of(i);
-            let row = i / a.area.width as usize;
-            if x <= last_nonblank_columns[row] {
-                updates.push(DrawCommand::Put {
-                    x,
-                    y,
-                    cell: next_buffer[i].clone(),
-                });
-            }
-        }
+    queue!(
+        writer,
+        SetForegroundColor(crossterm::style::Color::Reset),
+        SetBackgroundColor(crossterm::style::Color::Reset),
+        SetAttribute(crossterm::style::Attribute::Reset),
+    )?;
 
-        to_skip = display_width(current.symbol()).saturating_sub(1);
+    Ok(stats)
+}
 
-        let affected_width = std::cmp::max(
-            display_width(current.symbol()),
-            display_width(previous.symbol()),
-        );
-        invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
+fn draw_dense_run(
+    writer: &mut impl Write,
+    run: &DenseRun,
+    fg: &mut Color,
+    current_bg: &mut Color,
+    modifier: &mut Modifier,
+    next_pos: &mut Option<Position>,
+) -> io::Result<()> {
+    if *next_pos != Some(run.position) {
+        queue!(writer, MoveTo(run.position.x, run.position.y))?;
     }
-    updates
+    if run.modifier != *modifier {
+        let diff = ModifierDiff {
+            from: *modifier,
+            to: run.modifier,
+        };
+        diff.queue(writer)?;
+        *modifier = run.modifier;
+    }
+    if run.fg != *fg || run.bg != *current_bg {
+        queue!(writer, SetColors(Colors::new(run.fg.into(), run.bg.into())))?;
+        *fg = run.fg;
+        *current_bg = run.bg;
+    }
+
+    writer.write_all(&run.bytes)?;
+    *next_pos = Some(Position {
+        x: run.position.x.saturating_add(run.width),
+        y: run.position.y,
+    });
+
+    Ok(())
+}
+
+fn draw_dense_clear_to_end(
+    writer: &mut impl Write,
+    position: Position,
+    bg: Color,
+    fg: &mut Color,
+    current_bg: &mut Color,
+    modifier: &mut Modifier,
+    next_pos: &mut Option<Position>,
+) -> io::Result<()> {
+    if *next_pos != Some(position) {
+        queue!(writer, MoveTo(position.x, position.y))?;
+    }
+    if *modifier != Modifier::empty() || *fg != Color::Reset {
+        queue!(writer, SetAttribute(crossterm::style::Attribute::Reset))?;
+        *modifier = Modifier::empty();
+        *fg = Color::Reset;
+        *current_bg = Color::Reset;
+    }
+    if *current_bg != bg {
+        queue!(writer, SetBackgroundColor(bg.into()))?;
+        *current_bg = bg;
+    }
+    queue!(writer, Clear(crossterm::terminal::ClearType::UntilNewLine))?;
+    *next_pos = Some(position);
+    Ok(())
+}
+
+fn last_nonblank_column(row: &[Cell], bg: Color) -> Option<usize> {
+    row.iter()
+        .rposition(|cell| {
+            cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty()
+        })
+        .map(|column| column + display_width(row[column].symbol()).saturating_sub(1))
 }
 
 fn draw<I>(writer: &mut impl Write, commands: I) -> io::Result<()>
@@ -873,6 +1324,44 @@ mod tests {
     }
 
     #[test]
+    fn diff_buffers_skips_unchanged_blank_rows() {
+        let area = Rect::new(0, 0, 3, 2);
+        let previous = Buffer::empty(area);
+        let next = Buffer::empty(area);
+
+        let commands = diff_buffers(&previous, &next);
+
+        assert!(
+            commands.is_empty(),
+            "expected no commands for identical buffers; commands: {commands:?}",
+        );
+    }
+
+    #[test]
+    fn diff_buffers_clear_to_end_only_when_trailing_cells_changed() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+
+        previous.set_string(0, 0, "abc", Style::default());
+        next.set_string(0, 0, "a", Style::default());
+
+        let commands = diff_buffers(&previous, &next);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 1, y: 0, .. })),
+            "expected clear-to-end after shortened content; commands: {commands:?}",
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, DrawCommand::Put { x, y: 0, .. } if *x > 0)),
+            "expected trailing cells to be cleared instead of put individually; commands: {commands:?}",
+        );
+    }
+
+    #[test]
     fn diff_buffers_does_not_emit_clear_to_end_for_full_width_row() {
         let area = Rect::new(0, 0, 3, 2);
         let previous = Buffer::empty(area);
@@ -916,6 +1405,131 @@ mod tests {
                 .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, y: 0, .. })),
             "expected clear-to-end to start after the remaining wide char; commands: {commands:?}"
         );
+    }
+
+    #[test]
+    fn diff_buffers_updates_ascii_after_wide_char() {
+        let area = Rect::new(0, 0, 10, 1);
+        let previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+
+        next.set_string(0, 0, "中a", Style::default());
+
+        let commands = diff_buffers(&previous, &next);
+        assert!(
+            commands.iter().any(
+                |command| matches!(command, DrawCommand::Put { x: 0, y: 0, cell } if cell.symbol() == "中")
+            ),
+            "expected first wide char to be put; commands: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(
+                |command| matches!(command, DrawCommand::Put { x: 2, y: 0, cell } if cell.symbol() == "a")
+            ),
+            "expected ascii after wide char to be put; commands: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn dense_rows_rewrite_unicode_rows() {
+        let area = Rect::new(0, 0, 80, 1);
+        let mut next = Buffer::empty(area);
+        let mut output = Vec::new();
+        let text = "CJK 中 emoji 👩🏽‍💻 👍🏽 ไทย cafe\u{301}";
+
+        next.set_string(0, 0, text, Style::default());
+
+        let stats = draw_dense_rows(&mut output, &next, 0..1).expect("dense rows");
+        let text_bytes = text.as_bytes();
+        assert!(
+            output
+                .windows(text_bytes.len())
+                .any(|bytes| bytes == text_bytes),
+            "expected repaint to rewrite unicode row; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            2,
+            stats.commands,
+            "expected one text run plus trailing clear; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn dense_rows_skip_skip_cells() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut next = Buffer::empty(area);
+        let mut output = Vec::new();
+
+        next.set_string(0, 0, "abcd", Style::default());
+        next.cell_mut((1, 0))
+            .expect("cell should exist")
+            .set_skip(true);
+
+        let stats = draw_dense_rows(&mut output, &next, 0..1).expect("dense rows");
+
+        assert!(
+            !output.windows(1).any(|bytes| bytes == b"b"),
+            "expected dense render not to write skipped cell; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(2, stats.commands);
+    }
+
+    #[test]
+    fn dense_rows_update_flushed_rows_when_caller_clears_rows() {
+        let area = Rect::new(0, 0, 4, 2);
+        let mut terminal =
+            Terminal::with_options(CaptureBackend::new(/*width*/ 4, /*height*/ 2))
+                .expect("terminal");
+        terminal.set_viewport_area(area);
+
+        terminal
+            .draw(|frame| {
+                frame
+                    .buffer_mut()
+                    .set_string(0, 0, "aaaa", Style::default());
+                frame
+                    .buffer_mut()
+                    .set_string(0, 1, "bbbb", Style::default());
+            })
+            .expect("initial draw");
+
+        terminal
+            .draw_with_flush(|frame| {
+                frame.clear_rows(1..2);
+                frame
+                    .buffer_mut()
+                    .set_string(0, 1, "cccc", Style::default());
+                FrameFlush::Dense(1..2)
+            })
+            .expect("dense draw");
+
+        fn previous_row_text(
+            terminal: &Terminal<CaptureBackend>,
+            area: Rect,
+            row: usize,
+        ) -> String {
+            let start = row * usize::from(area.width);
+            terminal.previous_buffer().content[start..start + usize::from(area.width)]
+                .iter()
+                .map(Cell::symbol)
+                .collect::<String>()
+        }
+        assert_eq!("cccc", previous_row_text(&terminal, area, 1));
+
+        terminal
+            .draw_with_flush(|frame| {
+                frame.clear_rows(1..2);
+                frame
+                    .buffer_mut()
+                    .set_string(0, 1, "dddd", Style::default());
+                FrameFlush::Dense(1..2)
+            })
+            .expect("second dense draw");
+
+        assert_eq!("dddd", previous_row_text(&terminal, area, 1));
     }
 
     #[test]

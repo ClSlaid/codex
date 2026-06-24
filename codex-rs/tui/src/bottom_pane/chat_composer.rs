@@ -154,6 +154,7 @@ use ratatui::widgets::Block;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
+use std::borrow::Cow;
 
 use super::chat_composer_history::ChatComposerHistory;
 use super::chat_composer_history::HistoryEntry;
@@ -234,7 +235,9 @@ use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::textarea::PreparedWrapCache;
 use crate::bottom_pane::textarea::TextArea;
+use crate::bottom_pane::textarea::TextAreaHistoryCacheKey;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
@@ -249,6 +252,7 @@ use codex_file_search::FileMatch;
 #[cfg(test)]
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
+use std::cell::Cell as StdCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -262,6 +266,8 @@ use ratatui::style::Color;
 /// If the pasted content exceeds this number of characters, replace it with a
 /// placeholder in the UI.
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+const HISTORY_RECALL_PREWARM_LIMIT: usize = 32;
+const HISTORY_RECALL_PREWARM_RESIZE_DELAY: Duration = Duration::from_secs(1);
 
 fn user_input_too_large_message(actual_chars: usize) -> String {
     format!(
@@ -356,6 +362,9 @@ pub(crate) struct ChatComposer {
     history: ChatComposerHistory,
     footer: FooterState,
     has_focus: bool,
+    last_textarea_width: StdCell<Option<u16>>,
+    history_prewarm_due_at: StdCell<Option<Instant>>,
+    pending_history_render_cache_prewarms: HashSet<(TextAreaHistoryCacheKey, u16)>,
     frame_requester: Option<FrameRequester>,
     attachments: AttachmentState,
     placeholder_text: String,
@@ -389,6 +398,7 @@ pub(crate) struct ChatComposer {
     history_search_next_keys: Vec<KeyBinding>,
     editor_keymap: EditorKeymap,
     vim_normal_keymap: VimNormalKeymap,
+    dense_render_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -524,6 +534,9 @@ impl ChatComposer {
                 reasoning_up_key: primary_binding(&default_keymap.chat.increase_reasoning_effort),
             },
             has_focus: has_input_focus,
+            last_textarea_width: StdCell::new(None),
+            history_prewarm_due_at: StdCell::new(None),
+            pending_history_render_cache_prewarms: HashSet::new(),
             frame_requester: None,
             attachments: AttachmentState::default(),
             placeholder_text,
@@ -556,6 +569,7 @@ impl ChatComposer {
             history_search_next_keys: default_keymap.composer.history_search_next.clone(),
             editor_keymap: default_editor_keymap,
             vim_normal_keymap: default_vim_normal_keymap,
+            dense_render_pending: false,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -564,6 +578,10 @@ impl ChatComposer {
 
     pub(crate) fn set_frame_requester(&mut self, frame_requester: FrameRequester) {
         self.frame_requester = Some(frame_requester);
+    }
+
+    pub(crate) fn take_dense_render_pending(&mut self) -> bool {
+        std::mem::take(&mut self.dense_render_pending)
     }
 
     pub fn set_skill_mentions(&mut self, skills: Option<Vec<SkillMetadata>>) {
@@ -815,6 +833,14 @@ impl ChatComposer {
         entry_count: usize,
     ) {
         self.history.set_metadata(thread_id, log_id, entry_count);
+        self.reset_history_prewarm_schedule();
+    }
+
+    fn reset_history_prewarm_schedule(&self) {
+        self.history_prewarm_due_at.set(None);
+        if self.last_textarea_width.get().is_some() {
+            self.start_history_prewarm_after(Duration::ZERO);
+        }
     }
 
     /// Integrate an asynchronous response to an on-demand history lookup.
@@ -848,7 +874,111 @@ impl ChatComposer {
     }
 
     pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
-        self.history.record_replayed_submission(entry);
+        if let Some(entry) = self.history.record_replayed_submission_for_recall(entry) {
+            self.schedule_history_entry_render_cache_prewarm(&entry);
+        }
+    }
+
+    fn record_local_history_entry(&mut self, entry: HistoryEntry) {
+        if let Some(entry) = self.history.record_local_submission_for_recall(entry) {
+            self.schedule_history_entry_render_cache_prewarm(&entry);
+        }
+    }
+
+    fn schedule_history_entry_render_cache_prewarm(&mut self, entry: &HistoryEntry) {
+        let Some(thread_id) = self.history.thread_id() else {
+            return;
+        };
+        let Some(width) = self.last_textarea_width.get() else {
+            return;
+        };
+        if !TextArea::cacheable_text(&entry.text) {
+            return;
+        }
+        let Some(key) = entry.cache_key else {
+            return;
+        };
+        if !self
+            .pending_history_render_cache_prewarms
+            .insert((key, width))
+        {
+            return;
+        }
+        self.app_event_tx
+            .send(AppEvent::PrewarmHistoryEntryRenderCache {
+                thread_id,
+                key,
+                width,
+                text: entry.text.to_string(),
+            });
+    }
+
+    pub(crate) fn remember_history_entry_render_cache(&mut self, cache: PreparedWrapCache) {
+        if let Some(key) = cache.key() {
+            self.pending_history_render_cache_prewarms
+                .remove(&(key, cache.width()));
+        }
+        self.remember_current_width_wrap_cache(Some(cache));
+    }
+
+    fn remember_current_width_wrap_cache(&self, cache: Option<PreparedWrapCache>) {
+        let Some(cache) = cache else {
+            return;
+        };
+        if self.last_textarea_width.get() == Some(cache.width()) {
+            self.draft.textarea.remember_prepared_wrap_cache(cache);
+        }
+    }
+
+    pub(crate) fn schedule_history_cache_prewarm_at(&mut self, now: Instant) {
+        let Some(width) = self.last_textarea_width.get() else {
+            return;
+        };
+        let Some(due_at) = self.history_prewarm_due_at.get() else {
+            return;
+        };
+        if now < due_at {
+            if let Some(frame_requester) = &self.frame_requester {
+                frame_requester.schedule_frame_in(due_at - now);
+            }
+            return;
+        }
+
+        self.history.set_prewarm_width(width);
+        self.history
+            .schedule_recent_prewarm(HISTORY_RECALL_PREWARM_LIMIT, &self.app_event_tx);
+        for entry in self
+            .history
+            .recent_local_history_entries(HISTORY_RECALL_PREWARM_LIMIT)
+        {
+            self.schedule_history_entry_render_cache_prewarm(&entry);
+        }
+        self.history_prewarm_due_at.set(None);
+    }
+
+    fn observe_textarea_width(&self, width: u16) {
+        if self.last_textarea_width.get() == Some(width) {
+            return;
+        }
+        let delay = if self.last_textarea_width.get().is_some() {
+            HISTORY_RECALL_PREWARM_RESIZE_DELAY
+        } else {
+            Duration::ZERO
+        };
+        self.last_textarea_width.set(Some(width));
+        self.start_history_prewarm_after(delay);
+    }
+
+    fn start_history_prewarm_after(&self, delay: Duration) {
+        self.history_prewarm_due_at
+            .set(Some(Instant::now() + delay));
+        if let Some(frame_requester) = &self.frame_requester {
+            if delay > Duration::ZERO {
+                frame_requester.schedule_frame_in(delay);
+            } else {
+                frame_requester.schedule_frame();
+            }
+        }
     }
 
     /// Integrate pasted text into the composer.
@@ -948,7 +1078,7 @@ impl ChatComposer {
     /// remote images). Cursor is placed at the end after rebuilding elements.
     pub(crate) fn apply_external_edit(&mut self, text: String) {
         self.draft.pending_pastes.clear();
-        let (text, _) = self.imported_text_for_textarea(text, Vec::new());
+        let (text, _) = self.imported_text_for_textarea(&text, Vec::new());
 
         // Count placeholder occurrences in the new text.
         let mut placeholder_counts: HashMap<String, usize> = HashMap::new();
@@ -1225,6 +1355,23 @@ impl ChatComposer {
         local_image_paths: Vec<PathBuf>,
         mention_bindings: Vec<MentionBinding>,
     ) {
+        self.set_text_content_with_mention_bindings_inner(
+            &text,
+            text_elements,
+            local_image_paths,
+            mention_bindings,
+            /*history_cache_key*/ None,
+        );
+    }
+
+    fn set_text_content_with_mention_bindings_inner(
+        &mut self,
+        text: &str,
+        text_elements: Vec<TextElement>,
+        local_image_paths: Vec<PathBuf>,
+        mention_bindings: Vec<MentionBinding>,
+        history_cache_key: Option<TextAreaHistoryCacheKey>,
+    ) {
         // Clear any existing content, placeholders, and attachments first.
         self.draft.textarea.set_text_clearing_elements("");
         self.draft.is_bash_mode = false;
@@ -1232,9 +1379,17 @@ impl ChatComposer {
         self.draft.mention_bindings.clear();
 
         let (text, text_elements) = self.imported_text_for_textarea(text, text_elements);
-        self.draft
-            .textarea
-            .set_text_with_elements(&text, &text_elements);
+        if let Some(history_cache_key) = history_cache_key {
+            self.draft.textarea.set_text_with_history_cache_key(
+                &text,
+                &text_elements,
+                history_cache_key,
+            );
+        } else {
+            self.draft
+                .textarea
+                .set_text_with_elements(&text, &text_elements);
+        }
         self.attachments
             .reset_local_images(local_image_paths, &mut self.draft.textarea);
 
@@ -1259,10 +1414,14 @@ impl ChatComposer {
             && !self.draft.textarea.text().is_empty()
             && self.draft.textarea.cursor() == self.draft.textarea.vim_normal_end_cursor()
         {
-            self.current_text().len()
+            self.current_text_len()
         } else {
             self.current_cursor()
         }
+    }
+
+    fn current_text_len(&self) -> usize {
+        self.draft.textarea.text().len() + usize::from(self.draft.is_bash_mode)
     }
 
     fn set_current_cursor(&mut self, cursor: usize) {
@@ -1357,15 +1516,15 @@ impl ChatComposer {
     ///
     /// Shell mode stores the leading `!` as prompt state instead of editable text,
     /// so full-buffer imports must absorb that prefix before rebuilding the textarea.
-    fn imported_text_for_textarea(
+    fn imported_text_for_textarea<'a>(
         &mut self,
-        text: String,
+        text: &'a str,
         text_elements: Vec<TextElement>,
-    ) -> (String, Vec<TextElement>) {
+    ) -> (Cow<'a, str>, Vec<TextElement>) {
         if let Some(stripped) = text.strip_prefix('!') {
             self.draft.is_bash_mode = true;
             (
-                stripped.to_string(),
+                Cow::Borrowed(stripped),
                 text_elements
                     .into_iter()
                     .filter_map(|element| Self::shift_text_element(element, /*shift*/ -1))
@@ -1373,7 +1532,7 @@ impl ChatComposer {
             )
         } else {
             self.draft.is_bash_mode = false;
-            (text, text_elements)
+            (Cow::Borrowed(text), text_elements)
         }
     }
 
@@ -1390,8 +1549,9 @@ impl ChatComposer {
         self.set_text_content(String::new(), Vec::new(), Vec::new());
         self.attachments.clear_remote_image_urls();
         self.history.reset_navigation();
-        self.history.record_local_submission(HistoryEntry {
-            text: previous.clone(),
+        self.record_local_history_entry(HistoryEntry {
+            cache_key: None,
+            text: previous.clone().into(),
             text_elements,
             local_image_paths,
             remote_image_urls,
@@ -1410,6 +1570,16 @@ impl ChatComposer {
         }
     }
 
+    fn should_handle_history_navigation(&self) -> bool {
+        let cursor = self.history_navigation_cursor();
+        let text_len = self.current_text_len();
+        self.history.should_handle_navigation(
+            text_len == 0,
+            self.draft.textarea.history_cache_key(),
+            cursor == 0 || cursor == text_len,
+        )
+    }
+
     /// Rehydrate a history entry into the composer with shell-like cursor placement.
     ///
     /// This path restores text, elements, images, mention bindings, and pending paste payloads,
@@ -1419,6 +1589,7 @@ impl ChatComposer {
     /// treats interior positions as normal editing mode.
     fn apply_history_entry(&mut self, entry: HistoryEntry) {
         let HistoryEntry {
+            cache_key,
             text,
             text_elements,
             local_image_paths,
@@ -1427,14 +1598,21 @@ impl ChatComposer {
             pending_pastes,
         } = entry;
         self.set_remote_image_urls(remote_image_urls);
-        self.set_text_content_with_mention_bindings(
-            text,
+        self.set_text_content_with_mention_bindings_inner(
+            &text,
             text_elements,
             local_image_paths,
             mention_bindings,
+            cache_key,
         );
+        if let (Some(cache_key), Some(width)) = (cache_key, self.last_textarea_width.get()) {
+            self.draft
+                .textarea
+                .activate_recent_wrap_cache(width, cache_key);
+        }
         self.set_pending_pastes(pending_pastes);
         self.move_cursor_to_history_entry_end();
+        self.dense_render_pending = true;
     }
 
     pub(crate) fn text_elements(&self) -> Vec<TextElement> {
@@ -1480,7 +1658,7 @@ impl ChatComposer {
     /// slot is consumed on the first call.
     pub(crate) fn record_pending_slash_command_history(&mut self) {
         if let Some(entry) = self.pending_slash_command_history.take() {
-            self.history.record_local_submission(entry);
+            self.record_local_history_entry(entry);
         }
     }
 
@@ -2716,8 +2894,9 @@ impl ChatComposer {
         }
         self.draft.recent_submission_mention_bindings = original_mention_bindings.clone();
         if record_history && (!text.is_empty() || !self.attachments.is_empty()) {
-            self.history.record_local_submission(HistoryEntry {
-                text: text.clone(),
+            self.record_local_history_entry(HistoryEntry {
+                cache_key: None,
+                text: text.clone().into(),
                 text_elements: text_elements.clone(),
                 local_image_paths: self.attachments.local_image_paths(),
                 remote_image_urls: self.attachments.remote_image_urls(),
@@ -3011,7 +3190,8 @@ impl ChatComposer {
     /// workflows start carrying those through in the future.
     fn stage_slash_command_history_text(&mut self, text: String) {
         self.pending_slash_command_history = Some(HistoryEntry {
-            text,
+            cache_key: None,
+            text: text.into(),
             text_elements: self.draft.textarea.text_elements(),
             local_image_paths: self.attachments.local_image_paths(),
             remote_image_urls: self.attachments.remote_image_urls(),
@@ -3141,10 +3321,7 @@ impl ChatComposer {
             )
         };
         if history_up_pressed || history_down_pressed {
-            if self
-                .history
-                .should_handle_navigation(&self.current_text(), self.history_navigation_cursor())
-            {
+            if self.should_handle_history_navigation() {
                 let replace_entry = if history_up_pressed {
                     self.history.navigate_up(&self.app_event_tx)
                 } else {
@@ -3519,9 +3696,7 @@ impl ChatComposer {
         } else {
             self.current_editable_at_token()
         };
-        let browsing_history = self
-            .history
-            .should_handle_navigation(&self.current_text(), self.history_navigation_cursor());
+        let browsing_history = self.should_handle_history_navigation();
         // When browsing input history (shell-style Up/Down recall), skip all popup
         // synchronization so nothing steals focus from continued history navigation.
         if browsing_history {
@@ -4090,6 +4265,12 @@ impl Renderable for ChatComposer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TextareaRenderMode {
+    Normal,
+    DenseRender,
+}
+
 impl ChatComposer {
     pub(crate) fn desired_height_with_textarea_right_reserve(
         &self,
@@ -4140,8 +4321,43 @@ impl ChatComposer {
         mask_char: Option<char>,
         textarea_right_reserve: u16,
     ) {
+        self.render_with_mask_and_textarea_right_reserve_mode(
+            area,
+            buf,
+            mask_char,
+            textarea_right_reserve,
+            TextareaRenderMode::Normal,
+        );
+    }
+
+    pub(crate) fn render_dense_with_textarea_right_reserve(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        textarea_right_reserve: u16,
+    ) {
+        self.render_with_mask_and_textarea_right_reserve_mode(
+            area,
+            buf,
+            /*mask_char*/ None,
+            textarea_right_reserve,
+            TextareaRenderMode::DenseRender,
+        );
+    }
+
+    fn render_with_mask_and_textarea_right_reserve_mode(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        mask_char: Option<char>,
+        textarea_right_reserve: u16,
+        textarea_render_mode: TextareaRenderMode,
+    ) {
         let [composer_rect, remote_images_rect, textarea_rect, popup_rect] =
             self.layout_areas_with_textarea_right_reserve(area, textarea_right_reserve);
+        if textarea_rect.width > 0 {
+            self.observe_textarea_width(textarea_rect.width);
+        }
         match &self.popups.active {
             ActivePopup::Command(popup) => {
                 popup.render_ref(popup_rect, buf);
@@ -4385,7 +4601,14 @@ impl ChatComposer {
             }
         }
         let style = user_message_style();
-        Block::default().style(style).render_ref(composer_rect, buf);
+        match textarea_render_mode {
+            TextareaRenderMode::Normal => {
+                Block::default().style(style).render_ref(composer_rect, buf)
+            }
+            TextareaRenderMode::DenseRender => {
+                render_composer_style_except_textarea(composer_rect, textarea_rect, style, buf);
+            }
+        }
         if !remote_images_rect.is_empty() {
             Paragraph::new(self.attachments.remote_image_lines())
                 .style(style)
@@ -4426,12 +4649,18 @@ impl ChatComposer {
                         .map(|range| (range, search_highlight_style)),
                 );
                 if highlights.is_empty() {
-                    StatefulWidgetRef::render_ref(
-                        &(&self.draft.textarea),
-                        textarea_rect,
-                        buf,
-                        &mut state,
-                    );
+                    match textarea_render_mode {
+                        TextareaRenderMode::Normal => StatefulWidgetRef::render_ref(
+                            &(&self.draft.textarea),
+                            textarea_rect,
+                            buf,
+                            &mut state,
+                        ),
+                        TextareaRenderMode::DenseRender => self
+                            .draft
+                            .textarea
+                            .render_ref_into_cleared_area(textarea_rect, buf, &mut state),
+                    }
                 } else {
                     self.draft.textarea.render_ref_styled_with_highlights(
                         textarea_rect,
@@ -4459,6 +4688,56 @@ impl ChatComposer {
                     .render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
             }
         }
+    }
+}
+
+fn render_composer_style_except_textarea(
+    composer_rect: Rect,
+    textarea_rect: Rect,
+    style: Style,
+    buf: &mut Buffer,
+) {
+    if textarea_rect.is_empty() {
+        buf.set_style(composer_rect, style);
+        return;
+    }
+
+    let top = textarea_rect.y.saturating_sub(composer_rect.y);
+    if top > 0 {
+        buf.set_style(
+            Rect::new(composer_rect.x, composer_rect.y, composer_rect.width, top),
+            style,
+        );
+    }
+
+    let left = textarea_rect.x.saturating_sub(composer_rect.x);
+    if left > 0 {
+        buf.set_style(
+            Rect::new(composer_rect.x, textarea_rect.y, left, textarea_rect.height),
+            style,
+        );
+    }
+
+    let right = composer_rect.right().saturating_sub(textarea_rect.right());
+    if right > 0 {
+        buf.set_style(
+            Rect::new(
+                textarea_rect.right(),
+                textarea_rect.y,
+                right,
+                textarea_rect.height,
+            ),
+            style,
+        );
+    }
+
+    let bottom_y = textarea_rect.bottom();
+    let bottom = composer_rect.bottom().saturating_sub(bottom_y);
+    if bottom > 0 {
+        buf.set_style(
+            Rect::new(composer_rect.x, bottom_y, composer_rect.width, bottom),
+            style,
+        );
     }
 }
 
@@ -11189,5 +11468,533 @@ mod tests {
             .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap();
         insta::assert_snapshot!("shutdown_in_progress", terminal.backend());
+    }
+
+    #[test]
+    #[ignore]
+    fn history_recall_latency_100x8k_ab() {
+        use crate::custom_terminal::FrameFlush;
+        use crate::custom_terminal::Terminal;
+        use crate::custom_terminal::TerminalDrawTimings;
+        use ratatui::backend::Backend;
+        use ratatui::backend::ClearType;
+        use ratatui::backend::WindowSize;
+        use ratatui::layout::Position;
+        use ratatui::layout::Size;
+        use std::io;
+        use std::io::Write;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        const RECALL_SAMPLES: usize = 9 * 240;
+        const TERMINAL_PROFILED_TIMER_COUNT: usize = 6;
+        const RECALL_SAMPLE_TIMER_COUNT: usize = 3 + TERMINAL_PROFILED_TIMER_COUNT;
+
+        #[derive(Clone, Copy)]
+        struct RecallSample {
+            desired_height: Duration,
+            handle_key: Duration,
+            repaint_rows: Duration,
+            draw: TerminalDrawTimings,
+            total: Duration,
+            bytes_written: usize,
+        }
+
+        struct BenchmarkBackend {
+            size: Size,
+            cursor: Position,
+            bytes_written: usize,
+        }
+
+        impl BenchmarkBackend {
+            fn new(width: u16, height: u16) -> Self {
+                Self {
+                    size: Size { width, height },
+                    cursor: Position { x: 0, y: 0 },
+                    bytes_written: 0,
+                }
+            }
+        }
+
+        impl Write for BenchmarkBackend {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.bytes_written += buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Backend for BenchmarkBackend {
+            fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+            where
+                I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+            {
+                Ok(())
+            }
+
+            fn hide_cursor(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn show_cursor(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn get_cursor_position(&mut self) -> io::Result<Position> {
+                Ok(self.cursor)
+            }
+
+            fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+                self.cursor = position.into();
+                Ok(())
+            }
+
+            fn clear(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn append_lines(&mut self, _line_count: u16) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn scroll_region_up(
+                &mut self,
+                _region: std::ops::Range<u16>,
+                _scroll_by: u16,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn scroll_region_down(
+                &mut self,
+                _region: std::ops::Range<u16>,
+                _scroll_by: u16,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn size(&self) -> io::Result<Size> {
+                Ok(self.size)
+            }
+
+            fn window_size(&mut self) -> io::Result<WindowSize> {
+                Ok(WindowSize {
+                    columns_rows: self.size,
+                    pixels: self.size,
+                })
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn history_text(index: usize) -> String {
+            let fragment = format!(
+                "turn {index:03} CJK 混合 ASCII /tmp/codex/历史/{index}/file.rs \
+                 cargo test -p codex-tui history_{index} cafe\u{301} emoji 👩🏽‍💻 🚀 👍🏽 \
+                 ZWJ 👨🏿‍🚀 日本語 한글 中文 punctuation !? [] {{}} <> -- path-like-token-{index}\n"
+            );
+            let mut text = String::new();
+            while text.len() < 8 * 1024 {
+                text.push_str(&fragment);
+            }
+            text
+        }
+
+        fn build_composer(entries: &[String], drain_prewarm: bool) -> (ChatComposer, usize, usize) {
+            let (tx, mut rx) = unbounded_channel::<AppEvent>();
+            let mut composer = ChatComposer::new(
+                /*has_input_focus*/ true,
+                AppEventSender::new(tx),
+                /*enhanced_keys_supported*/ false,
+                "Ask Codex to do anything".to_string(),
+                /*disable_paste_burst*/ false,
+            );
+            composer.set_history_metadata(
+                ThreadId::new(),
+                /*log_id*/ 7,
+                /*entry_count*/ 0,
+            );
+            composer.observe_textarea_width(/*width*/ 80);
+
+            let total_bytes = entries.iter().map(String::len).sum::<usize>();
+            for entry in entries {
+                composer.record_local_history_entry(HistoryEntry::new(entry.clone()));
+            }
+
+            let mut prewarmed = 0usize;
+            if drain_prewarm {
+                while let Ok(event) = rx.try_recv() {
+                    if let AppEvent::PrewarmHistoryEntryRenderCache {
+                        key, width, text, ..
+                    } = event
+                    {
+                        let cache =
+                            crate::bottom_pane::prepare_textarea_wrap_cache(key, width, text);
+                        composer.remember_history_entry_render_cache(cache);
+                        prewarmed += 1;
+                    }
+                }
+            }
+            (composer, total_bytes, prewarmed)
+        }
+
+        fn recall_keys() -> impl Iterator<Item = KeyCode> {
+            [KeyCode::Up; 12]
+                .into_iter()
+                .chain([KeyCode::Down; 12])
+                .cycle()
+                .take(RECALL_SAMPLES)
+        }
+
+        fn benchmark_terminal() -> Terminal<BenchmarkBackend> {
+            let mut terminal = Terminal::with_options(BenchmarkBackend::new(
+                /*width*/ 80, /*height*/ 48,
+            ))
+            .expect("terminal");
+            terminal.set_viewport_area(Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
+            ));
+            terminal
+        }
+
+        fn drive_recall_keys(
+            composer: &mut ChatComposer,
+            terminal: &mut Terminal<BenchmarkBackend>,
+            keys: impl IntoIterator<Item = KeyCode>,
+        ) -> Vec<RecallSample> {
+            let mut samples = Vec::with_capacity(RECALL_SAMPLES);
+            let area = Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 48,
+            );
+            let initial_repaint_height = composer.desired_height(area.width).min(area.height);
+            let mut previous_repaint_top = area.bottom().saturating_sub(initial_repaint_height);
+            for key in keys {
+                let bytes_before = terminal.backend().bytes_written;
+                let total_start = Instant::now();
+                let started = Instant::now();
+                let _ = composer.desired_height(area.width);
+                let desired_height = started.elapsed();
+
+                let started = Instant::now();
+                let _ = composer.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
+                let handle_key = started.elapsed();
+                let started = Instant::now();
+                let repaint_rows = composer.take_dense_render_pending().then(|| {
+                    let repaint_height = composer.desired_height(area.width).min(area.height);
+                    let repaint_top = area.bottom().saturating_sub(repaint_height);
+                    let top = previous_repaint_top.min(repaint_top);
+                    previous_repaint_top = repaint_top;
+                    top..area.bottom()
+                });
+                let repaint_rows_duration = started.elapsed();
+
+                let draw = terminal
+                    .draw_profiled(|frame| {
+                        match repaint_rows.clone() {
+                            Some(rows) => {
+                                frame.clear_rows(rows.clone());
+                                composer.render_dense_with_textarea_right_reserve(
+                                    frame.area(),
+                                    frame.buffer_mut(),
+                                    /*textarea_right_reserve*/ 0,
+                                );
+                                FrameFlush::Dense(rows)
+                            }
+                            None => {
+                                composer.render(frame.area(), frame.buffer_mut());
+                                FrameFlush::Sparse
+                            }
+                        }
+                    })
+                    .unwrap();
+                samples.push(RecallSample {
+                    desired_height,
+                    handle_key,
+                    repaint_rows: repaint_rows_duration,
+                    draw,
+                    total: total_start.elapsed(),
+                    bytes_written: terminal.backend().bytes_written - bytes_before,
+                });
+            }
+            samples
+        }
+
+        fn drive_recall_minimal(
+            composer: &mut ChatComposer,
+            terminal: &mut Terminal<BenchmarkBackend>,
+        ) -> Vec<RecallSample> {
+            drive_recall_keys(composer, terminal, recall_keys())
+        }
+
+        fn measure_nested_probe_overhead(measurements: usize) -> Vec<Duration> {
+            let mut samples = Vec::with_capacity(RECALL_SAMPLES);
+            for _ in 0..RECALL_SAMPLES {
+                let total_start = Instant::now();
+                for _ in 0..measurements {
+                    let started = Instant::now();
+                    let _ = started.elapsed();
+                }
+                samples.push(total_start.elapsed());
+            }
+            samples
+        }
+
+        fn median(samples: &[Duration]) -> Duration {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn emit_result(args: std::fmt::Arguments<'_>) {
+            use std::io::Write;
+
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_fmt(args).expect("write benchmark result");
+            stdout
+                .write_all(b"\n")
+                .expect("write benchmark result newline");
+        }
+
+        fn print_duration_summary(label: &str, samples: &[Duration], probe_overhead: Duration) {
+            let mut corrected = samples
+                .iter()
+                .map(|sample| sample.saturating_sub(probe_overhead))
+                .collect::<Vec<_>>();
+            corrected.sort_unstable();
+            let total = samples.iter().sum::<Duration>();
+            let p50 = corrected[corrected.len() / 2];
+            let p95 = corrected[corrected.len() * 95 / 100];
+            let max = corrected[corrected.len() - 1];
+            emit_result(format_args!(
+                "RESULT {label} samples={} total_ms={:.3} p50_ms={:.4} p95_ms={:.4} max_ms={:.4}",
+                samples.len(),
+                total.as_secs_f64() * 1000.0,
+                p50.as_secs_f64() * 1000.0,
+                p95.as_secs_f64() * 1000.0,
+                max.as_secs_f64() * 1000.0
+            ));
+        }
+
+        fn print_usize_summary(label: &str, samples: &[usize]) {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            let total = samples.iter().sum::<usize>();
+            let p50 = sorted[sorted.len() / 2];
+            let p95 = sorted[sorted.len() * 95 / 100];
+            let max = sorted[sorted.len() - 1];
+            emit_result(format_args!(
+                "RESULT {label} samples={} total={total} p50={p50} p95={p95} max={max}",
+                samples.len(),
+            ));
+        }
+
+        fn print_recall_summary(
+            label: &str,
+            samples: &[RecallSample],
+            phase_probe_overhead: Duration,
+            terminal_probe_overhead: Duration,
+            recall_probe_overhead: Duration,
+        ) {
+            print_duration_summary(
+                &format!("{label}.total"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.total)
+                    .collect::<Vec<_>>(),
+                recall_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.desired_height"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.desired_height)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.handle_key"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.handle_key)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_total"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.total)
+                    .collect::<Vec<_>>(),
+                terminal_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.repaint_rows"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.repaint_rows)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_autoresize"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.autoresize)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_render"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.render)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_diff"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.diff)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_encode"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.encode)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_cursor"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.cursor)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_buffer_swap"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.buffer_swap)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_duration_summary(
+                &format!("{label}.terminal_backend_flush"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.backend_flush)
+                    .collect::<Vec<_>>(),
+                phase_probe_overhead,
+            );
+            print_usize_summary(
+                &format!("{label}.terminal_commands"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.draw.commands)
+                    .collect::<Vec<_>>(),
+            );
+            print_usize_summary(
+                &format!("{label}.terminal_bytes"),
+                &samples
+                    .iter()
+                    .map(|sample| sample.bytes_written)
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let entries = (0..100).map(history_text).collect::<Vec<_>>();
+        let phase_probe_overhead_samples = measure_nested_probe_overhead(0);
+        let phase_probe_overhead = median(&phase_probe_overhead_samples);
+        print_duration_summary(
+            "probe_overhead.phase",
+            &phase_probe_overhead_samples,
+            Duration::ZERO,
+        );
+        let terminal_probe_overhead_samples =
+            measure_nested_probe_overhead(TERMINAL_PROFILED_TIMER_COUNT);
+        let terminal_probe_overhead = median(&terminal_probe_overhead_samples);
+        print_duration_summary(
+            "probe_overhead.terminal_sample",
+            &terminal_probe_overhead_samples,
+            Duration::ZERO,
+        );
+        let recall_probe_overhead_samples =
+            measure_nested_probe_overhead(RECALL_SAMPLE_TIMER_COUNT);
+        let recall_probe_overhead = median(&recall_probe_overhead_samples);
+        print_duration_summary(
+            "probe_overhead.recall_sample",
+            &recall_probe_overhead_samples,
+            Duration::ZERO,
+        );
+
+        let (mut composer, total_bytes, prewarm_ready) =
+            build_composer(&entries, /*drain_prewarm*/ false);
+        emit_result(format_args!("RESULT sample_bytes={total_bytes}"));
+        emit_result(format_args!(
+            "RESULT without_prewarm_ready count={prewarm_ready}"
+        ));
+        let mut terminal = benchmark_terminal();
+        let up_12_first_without_prewarm =
+            drive_recall_keys(&mut composer, &mut terminal, [KeyCode::Up; 12]);
+        print_recall_summary(
+            "up_12_first_without_prewarm",
+            &up_12_first_without_prewarm,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
+        );
+
+        let (mut composer, _, prewarm_ready) =
+            build_composer(&entries, /*drain_prewarm*/ true);
+        emit_result(format_args!(
+            "RESULT with_prewarm_ready count={prewarm_ready}"
+        ));
+        let mut terminal = benchmark_terminal();
+        let up_12_first_with_prewarm =
+            drive_recall_keys(&mut composer, &mut terminal, [KeyCode::Up; 12]);
+        print_recall_summary(
+            "up_12_first_with_prewarm",
+            &up_12_first_with_prewarm,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
+        );
+
+        let (mut composer, _, prewarm_ready) =
+            build_composer(&entries, /*drain_prewarm*/ true);
+        emit_result(format_args!(
+            "RESULT pr_prewarm_ready count={prewarm_ready}"
+        ));
+        let mut terminal = benchmark_terminal();
+        let initial = drive_recall_minimal(&mut composer, &mut terminal);
+        let repeat = drive_recall_minimal(&mut composer, &mut terminal);
+        print_recall_summary(
+            "pr_prewarmed_custom_minimal_initial",
+            &initial,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
+        );
+        print_recall_summary(
+            "pr_prewarmed_custom_minimal_repeat",
+            &repeat,
+            phase_probe_overhead,
+            terminal_probe_overhead,
+            recall_probe_overhead,
+        );
     }
 }

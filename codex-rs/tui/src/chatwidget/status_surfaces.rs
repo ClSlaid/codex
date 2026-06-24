@@ -441,7 +441,11 @@ impl ChatWidget {
     /// nearest project config layer so non-git projects can still surface a
     /// stable project label.
     fn status_line_project_root_for_cwd(&self, cwd: &Path) -> Option<PathBuf> {
-        if let Some(repo_root) = get_git_repo_root(cwd) {
+        // Avoid resolving deleted, synthetic, or remote-only cwd paths through
+        // an unrelated local parent repository.
+        if cwd.exists()
+            && let Some(repo_root) = get_git_repo_root(cwd)
+        {
             return Some(repo_root);
         }
 
