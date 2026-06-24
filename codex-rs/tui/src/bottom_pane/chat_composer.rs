@@ -1605,6 +1605,11 @@ impl ChatComposer {
             mention_bindings,
             cache_key,
         );
+        if let (Some(cache_key), Some(width)) = (cache_key, self.last_textarea_width.get()) {
+            self.draft
+                .textarea
+                .activate_recent_wrap_cache(width, cache_key);
+        }
         self.set_pending_pastes(pending_pastes);
         self.move_cursor_to_history_entry_end();
         self.dense_render_pending = true;

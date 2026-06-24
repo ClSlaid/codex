@@ -573,7 +573,7 @@ where
             FrameFlush::Sparse => None,
             FrameFlush::Dense(rows) => Some(rows),
         };
-        let (diff, encode, commands) = self.flush_profiled(dense_rows.clone())?;
+        let (diff, encode, commands) = self.flush_profiled(dense_rows)?;
 
         let started = Instant::now();
         match cursor_position {

@@ -354,6 +354,29 @@ impl TextArea {
         }
     }
 
+    pub(crate) fn activate_recent_wrap_cache(&self, width: u16, key: TextAreaHistoryCacheKey) {
+        if self.history_cache_key != Some(key) {
+            return;
+        }
+        if self.wrap_cache.borrow().as_ref().is_some_and(|current| {
+            current.width == width
+                && current.key == Some(key)
+                && current.generation == self.generation
+        }) {
+            return;
+        }
+        let Some(mut cache) = self.take_recent_wrap_cache(width, Some(key)) else {
+            return;
+        };
+        // History recall wants the first repaint to use the prepared cache immediately instead of
+        // discovering it lazily while rendering the frame.
+        if let Some(old_cache) = self.wrap_cache.replace(None) {
+            self.remember_wrap_cache(old_cache);
+        }
+        cache.generation = self.generation;
+        self.wrap_cache.replace(Some(cache));
+    }
+
     pub fn new() -> Self {
         let defaults = RuntimeKeymap::defaults();
         Self {
